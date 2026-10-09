@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xhs-pipeline"
-version = "0.3.0"
+version = "0.3.1rc2"
 description = "Industrial-grade Xiaohongshu research, multi-driver crawling, reproducibility manifests, and Obsidian PKM pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -36,7 +36,11 @@ dev = [
 ]
 
 [project.scripts]
-xhs-pipeline = "scripts.run_pipeline:main"
+xhs-pipeline = "scripts.run_pipeline:cli_entrypoint"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "scripts*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -97,7 +97,7 @@ class MockDriver(BaseCrawlerDriver):
         if isinstance(target, NoteReference) and target.is_expired():
             raise ReferenceExpiredError(f"Access token for note {note_id} has expired.", note_id=note_id)
 
-        return UnifiedNote(
+        note = UnifiedNote(
             note_id=note_id,
             title="【测试详情】单篇笔记详情样板",
             desc="单篇笔记详细正文，无需虚构搜索关键词。",
@@ -108,3 +108,6 @@ class MockDriver(BaseCrawlerDriver):
             metrics=EngagementMetrics.from_raw(100, 50, 20, 5),
             url=f"https://www.xiaohongshu.com/explore/{note_id}"
         )
+        if isinstance(target, NoteReference) and target.discovered_keyword:
+            note.add_discovery(keyword=target.discovered_keyword, rank=target.rank, source_type="reference")
+        return note

@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Storage & Exporters Module (v0.3.0)
+Storage & Exporters Module (v0.3.1)
 Single-responsibility export components implementing:
-- Atomic file writes (write to temp, flush, atomic replace) to prevent crash corruption.
+- Atomic file writes (write to unique temp, flush, fsync, atomic replace) to prevent crash corruption.
 - SHA-256 content hash tracking for consistency reconciliation.
-- Non-destructive Obsidian updates preserving user manual annotations.
+- Non-destructive Obsidian updates preserving user manual annotations (protection against read failures).
+- Formula injection protection in CSV exports.
 - Explicit FieldPresence rendering (distinguishing uncollected from zero).
 """
 
 import os
 import csv
 import re
+import time
+import logging
 import hashlib
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
@@ -21,6 +24,15 @@ from .contracts import (
     ContentCompleteness,
     StageStatus
 )
+
+logger = logging.getLogger("xhs_pipeline.storage")
+
+
+def sanitize_csv_cell(val: Any) -> Any:
+    """Neutralizes spreadsheet formula injection (=, +, -, @, \t, \r)."""
+    if isinstance(val, str) and val and val[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + val
+    return val
 
 
 class ObsidianExporter:
@@ -42,6 +54,17 @@ class ObsidianExporter:
             return "[采集失败]"
         return raw_val if raw_val else "0"
 
+    def _find_existing_file(self, note_id: str) -> Optional[str]:
+        """Finds existing file for note_id with exact prefix matching to prevent prefix collision."""
+        if not os.path.exists(self.vault_dir):
+            return None
+        safe_id = re.escape(note_id)
+        pattern = re.compile(rf"^XHS_{safe_id}(_.*)?\.md$")
+        for p in Path(self.vault_dir).iterdir():
+            if p.is_file() and pattern.match(p.name):
+                return str(p)
+        return None
+
     def export_note(self, note: UnifiedNote) -> Tuple[str, str]:
         """
         Atomically exports a single note to Obsidian.
@@ -50,10 +73,10 @@ class ObsidianExporter:
         """
         safe_title = note.get_sanitized_title()
 
-        # Idempotent file naming: find existing card by note_id
-        existing_matches = list(Path(self.vault_dir).glob(f"XHS_{note.note_id}*.md"))
-        if existing_matches:
-            file_path = str(existing_matches[0])
+        # Idempotent file naming: find existing card with exact note_id match
+        existing_file = self._find_existing_file(note.note_id)
+        if existing_file:
+            file_path = existing_file
         else:
             filename = f"XHS_{note.note_id}_{safe_title[:30]}.md" if safe_title else f"XHS_{note.note_id}.md"
             file_path = os.path.join(self.vault_dir, filename)
@@ -65,9 +88,12 @@ class ObsidianExporter:
                 with open(file_path, "r", encoding="utf-8") as f:
                     old_content = f.read()
                     if self.USER_NOTES_HEADER in old_content:
-                        preserved_user_notes = old_content.split(self.USER_NOTES_HEADER)[1]
-            except Exception:
-                pass
+                        # Extract from the LAST occurrence to avoid false matches in source description
+                        preserved_user_notes = old_content.rsplit(self.USER_NOTES_HEADER, 1)[1]
+            except OSError as e:
+                # If existing file cannot be read, never silently overwrite human annotations!
+                logger.error(f"Cannot read existing card {file_path} to preserve annotations: {e}")
+                raise OSError(f"Existing card read failure, aborted overwrite to preserve human annotations: {e}")
 
         # 2. Render tags and keywords
         tags_yaml = "\n".join([f"  - {t}" for t in note.tag_list if t])
@@ -93,7 +119,7 @@ class ObsidianExporter:
         collects_display = self._format_metric_display(note.metrics.raw_collects, note.metrics.collects_presence)
         comments_display = self._format_metric_display(note.metrics.raw_comments, note.metrics.comments_presence)
 
-        # 5. Build Markdown card
+        # 5. Build Markdown card with LF line endings
         md_content = f"""---
 note_id: "{note.note_id}"
 title: "{note.title.replace('"', "'")}"
@@ -141,15 +167,16 @@ tags:
 {preserved_user_notes if preserved_user_notes else '\n> 在此记录您针对该笔记的研究心得、拆解要点或仿写灵感（重新导出时将受到永久保护，不会被覆盖）。\n'}
 """
 
-        # 6. Atomic Write: write to .tmp file, then replace
-        temp_file = file_path + ".tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            f.write(md_content)
+        # 6. Atomic Write: write exact bytes to unique .tmp file, then replace
+        temp_file = f"{file_path}.{os.getpid()}_{time.time_ns()}.tmp"
+        md_bytes = md_content.encode("utf-8")
+        with open(temp_file, "wb") as f:
+            f.write(md_bytes)
             f.flush()
             os.fsync(f.fileno())
 
         os.replace(temp_file, file_path)
-        written_hash = hashlib.sha256(md_content.encode("utf-8")).hexdigest()[:16]
+        written_hash = hashlib.sha256(md_bytes).hexdigest()
         note.stage_status = StageStatus.EXPORTED
 
         return file_path, written_hash
@@ -163,7 +190,7 @@ tags:
 
 
 class CsvExporter:
-    """Exports notes to a structured CSV table with typed metrics and explicit field presence."""
+    """Exports notes to a structured CSV table with typed metrics and formula injection protection."""
 
     def __init__(self, output_path: str):
         self.output_path = output_path
@@ -183,5 +210,7 @@ class CsvExporter:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for n in notes:
-                writer.writerow(n.to_dict())
+                raw_dict = n.to_dict()
+                sanitized_dict = {k: sanitize_csv_cell(v) for k, v in raw_dict.items()}
+                writer.writerow(sanitized_dict)
         return self.output_path

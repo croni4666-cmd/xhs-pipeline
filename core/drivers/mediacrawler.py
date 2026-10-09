@@ -13,6 +13,8 @@ Improvements:
 import os
 import sys
 import json
+import time
+import ast
 import asyncio
 import re
 import logging
@@ -34,7 +36,8 @@ from ..contracts import (
     DriverError,
     AuthenticationError,
     RateLimitError,
-    ReferenceExpiredError
+    ReferenceExpiredError,
+    sanitize_note_url
 )
 
 logger = logging.getLogger("xhs_pipeline.drivers.mediacrawler")
@@ -64,7 +67,7 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
     def capabilities(self) -> DriverCapabilities:
         return DriverCapabilities(
             can_search=True,
-            can_get_detail=True,
+            can_get_detail=False,
             can_get_comments=True,
             can_get_media=True,
             requires_browser=True,
@@ -95,6 +98,14 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         except Exception:
             return False
 
+    def _sanitize_error_msg(self, msg: str) -> str:
+        msg = re.sub(r'xsec_token=[a-zA-Z0-9_\-]+', 'xsec_token=[REDACTED]', msg)
+        msg = re.sub(r'(Bearer\s+)[a-zA-Z0-9_\.\-]+', r'\1[REDACTED]', msg)
+        msg = re.sub(r'cookie:[^\r\n]+', 'cookie: [REDACTED]', msg, flags=re.IGNORECASE)
+        msg = re.sub(r'[A-Za-z]:\\[^ \t\r\n]+', '[REDACTED_PATH]', msg)
+        msg = re.sub(r'/(?:home|Users)/[^ \t\r\n]+', '[REDACTED_PATH]', msg)
+        return msg
+
     def _configure_mediacrawler(self, request: CrawlRequest) -> None:
         config_file = os.path.join(self.mediacrawler_path, "config", "base_config.py")
         if not os.path.exists(config_file):
@@ -103,16 +114,30 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         with open(config_file, "r", encoding="utf-8") as f:
             content = f.read()
 
-        kw_str = ",".join(request.keywords)
-        content = re.sub(r'KEYWORDS\s*=\s*["\'].*?["\']', f'KEYWORDS = "{kw_str}"', content)
-        content = re.sub(r'CRAWLER_MAX_NOTES_COUNT\s*=\s*\d+', f'CRAWLER_MAX_NOTES_COUNT = {request.max_count_per_keyword}', content)
-        content = re.sub(r'ENABLE_GET_COMMENTS\s*=\s*(True|False)', f'ENABLE_GET_COMMENTS = {request.enable_comments}', content)
+        safe_kw_literal = json.dumps(",".join(request.keywords), ensure_ascii=False)
+        safe_count = int(request.max_count_per_keyword)
+        safe_comments = bool(request.enable_comments)
+
+        content = re.sub(r'KEYWORDS\s*=\s*["\'].*?["\']', lambda _: f'KEYWORDS = {safe_kw_literal}', content)
+        content = re.sub(r'CRAWLER_MAX_NOTES_COUNT\s*=\s*\d+', lambda _: f'CRAWLER_MAX_NOTES_COUNT = {safe_count}', content)
+        content = re.sub(r'ENABLE_GET_COMMENTS\s*=\s*(True|False)', lambda _: f'ENABLE_GET_COMMENTS = {safe_comments}', content)
         content = re.sub(r'ENABLE_CDP_MODE\s*=\s*(True|False)', 'ENABLE_CDP_MODE = True', content)
         content = re.sub(r'CDP_CONNECT_EXISTING\s*=\s*(True|False)', 'CDP_CONNECT_EXISTING = True', content)
         content = re.sub(r'AUTO_CLOSE_BROWSER\s*=\s*(True|False)', 'AUTO_CLOSE_BROWSER = False', content)
 
-        with open(config_file, "w", encoding="utf-8") as f:
+        # Syntax AST validation to ensure no code injection
+        try:
+            ast.parse(content)
+        except Exception as e:
+            raise DriverError(f"Generated MediaCrawler configuration is invalid: {e}")
+
+        # Atomic configuration write
+        temp_file = f"{config_file}.{os.getpid()}_{time.time_ns()}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
             f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, config_file)
 
     def _determine_completeness(self, note_type: str, desc: str) -> ContentCompleteness:
         if not desc or len(desc.strip()) == 0:
@@ -132,6 +157,7 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                 errors=["CDP port 9222 is unreachable. Ensure Edge/Chrome is launched via start_edge_debug.bat."]
             )
 
+        start_time = time.time()
         self._configure_mediacrawler(request)
 
         env = os.environ.copy()
@@ -161,7 +187,7 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
             self._current_subprocess = None
 
         if proc.returncode != 0:
-            err_msg = stderr.decode("utf-8", errors="replace")
+            err_msg = self._sanitize_error_msg(stderr.decode("utf-8", errors="replace"))
             return CrawlResponse(
                 success=False,
                 driver_name=self.name,
@@ -174,7 +200,16 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         if not os.path.exists(data_dir):
             return CrawlResponse(success=True, driver_name=self.name, total_notes=0, notes=[])
 
-        jsonl_files = sorted(Path(data_dir).glob("search_contents_*.jsonl"), key=os.path.getmtime, reverse=True)
+        # Isolate candidate files created/updated in this task window
+        task_candidates = [
+            p for p in Path(data_dir).glob("search_contents_*.jsonl")
+            if os.path.getmtime(p) >= start_time - 5.0
+        ]
+        if task_candidates:
+            jsonl_files = sorted(task_candidates, key=os.path.getmtime, reverse=True)
+        else:
+            jsonl_files = sorted(Path(data_dir).glob("search_contents_*.jsonl"), key=os.path.getmtime, reverse=True)
+
         if not jsonl_files:
             return CrawlResponse(success=True, driver_name=self.name, total_notes=0, notes=[])
 
@@ -206,8 +241,7 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                     note_type = str(raw.get("type", "normal"))
                     desc_text = str(raw.get("desc", ""))
                     completeness = self._determine_completeness(note_type, desc_text)
-                    raw_url = str(raw.get("note_url", ""))
-                    clean_url = raw_url.split("?")[0] if "?" in raw_url else raw_url
+                    clean_url = sanitize_note_url(str(raw.get("note_url", "")))
                     note_id = str(raw.get("note_id", ""))
 
                     note = UnifiedNote(

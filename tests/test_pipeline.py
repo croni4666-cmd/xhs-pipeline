@@ -42,6 +42,7 @@ from core import (
     HttpCrawlerDriver,
     DataCleaner,
     ObsidianExporter,
+    CsvExporter,
     CheckpointStore,
     RequestBudgetManager,
     CircuitBreaker,
@@ -59,14 +60,14 @@ def test_version_consistency():
     file_version = version_file.read_text(encoding="utf-8").strip()
 
     assert file_version == __version__, f"VERSION file ({file_version}) != core.__version__ ({__version__})"
-    assert __version__ == "0.3.0", f"Expected version 0.3.0, got {__version__}"
+    assert __version__ == "0.3.1rc2", f"Expected version 0.3.1rc2, got {__version__}"
 
     pyproject_file = Path(root_dir) / "pyproject.toml"
-    assert 'version = "0.3.0"' in pyproject_file.read_text(encoding="utf-8")
+    assert 'version = "0.3.1rc2"' in pyproject_file.read_text(encoding="utf-8")
 
     changelog_file = Path(root_dir) / "CHANGELOG.md"
-    assert '## [0.3.0]' in changelog_file.read_text(encoding="utf-8")
-    print("[√] Version consistency verified (0.3.0).")
+    assert '## [0.3.1rc2]' in changelog_file.read_text(encoding="utf-8")
+    print("[√] Version consistency verified (0.3.1rc2).")
 
 
 def test_field_presence_and_metric_parsing():
@@ -308,6 +309,94 @@ def test_multi_driver_execution():
     print("[√] Multi-driver pipeline execution verified.")
 
 
+def test_config_injection_defense():
+    """F01 Regression: Ensure keywords with quotes and newlines cannot inject Python AST statements."""
+    import ast
+    from core.drivers.mediacrawler import MediaCrawlerDriver
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg_dir = Path(tmpdir) / "config"
+        cfg_dir.mkdir(parents=True)
+        base_cfg = cfg_dir / "base_config.py"
+        base_cfg.write_text('KEYWORDS = "default"\nCRAWLER_MAX_NOTES_COUNT = 10\n', encoding="utf-8")
+
+        driver = MediaCrawlerDriver({"mediacrawler_path": tmpdir})
+        malicious_kw = 'safe"\nINJECTED_ATTACK = True\n#'
+        driver._configure_mediacrawler(CrawlRequest(keywords=[malicious_kw]))
+
+        tree = ast.parse(base_cfg.read_text(encoding="utf-8"))
+        has_injection = any(
+            isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "INJECTED_ATTACK" for t in n.targets)
+            for n in tree.body
+        )
+        assert not has_injection, "Malicious keyword must not inject new Python assignment statements"
+    print("[√] F01 Config injection defense verified.")
+
+
+def test_credential_isolation_and_url_sanitization():
+    """F02 Regression: Ensure non-resumable tokens are not saved to disk, and URLs are sanitized."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = CheckpointStore(state_dir=tmpdir)
+        ref = NoteReference(
+            note_id="sec_01",
+            driver_name="test",
+            access_token="SECRET_TOKEN_XYZ",
+            access_context={"Cookie": "SESSION_SECRET"},
+            can_resume_cross_process=False
+        )
+        saved_file = store.save_references("task_sec", [ref])
+        content = Path(saved_file).read_text(encoding="utf-8")
+        assert "SECRET_TOKEN_XYZ" not in content, "Non-resumable token must not be saved to disk"
+        assert "SESSION_SECRET" not in content, "Non-resumable cookie must not be saved to disk"
+
+        # URL token sanitization
+        note = UnifiedNote(
+            note_id="url_01",
+            title="Test",
+            url="https://www.xiaohongshu.com/explore/url_01?xsec_token=LEAKED_TOKEN&param=1#fragment"
+        )
+        assert "xsec_token" not in note.url
+        assert note.url == "https://www.xiaohongshu.com/explore/url_01"
+    print("[√] F02 Credential isolation & URL sanitization verified.")
+
+
+def test_csv_formula_injection_defense():
+    """F02/Probe: CSV export neutralizes spreadsheet formula injection (=, +, -, @)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        exporter = CsvExporter(os.path.join(tmpdir, "formula.csv"))
+        note = UnifiedNote("formula_note", title="=1+1", desc="@SUM(A1:A10)")
+        csv_file = exporter.export([note])
+        content = Path(csv_file).read_text(encoding="utf-8-sig")
+        assert "'=1+1" in content
+        assert "'@SUM(A1:A10)" in content
+    print("[√] CSV formula injection defense verified.")
+
+
+def test_prefix_collision_defense():
+    """F05 Regression: Note 'abc123' must not overwrite or match 'abc1234'."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        exporter = ObsidianExporter(vault_dir=tmpdir)
+        note_long = UnifiedNote("abc1234", title="Long ID")
+        path_long, _ = exporter.export_note(note_long)
+
+        note_short = UnifiedNote("abc123", title="Short ID")
+        path_short, _ = exporter.export_note(note_short)
+
+        assert path_long != path_short, "Prefix collision: Short ID must not reuse long ID card"
+        assert len(list(Path(tmpdir).glob("*.md"))) == 2
+        assert "abc1234" in Path(path_long).read_text(encoding="utf-8")
+        assert "abc123" in Path(path_short).read_text(encoding="utf-8")
+    print("[√] F05 Prefix collision defense verified.")
+
+
+def test_content_hash_collision_resistance():
+    """Contracts: Collision resistance for title and desc serialization in content hash."""
+    note1 = UnifiedNote("h1", title="a|b", desc="c")
+    note2 = UnifiedNote("h2", title="a", desc="b|c")
+    assert note1.content_hash != note2.content_hash, "title|desc delimiter must not cause hash collision"
+    assert len(note1.content_hash) == 64, "content_hash must be full 64-character SHA-256"
+    print("[√] Content hash collision resistance verified.")
+
+
 if __name__ == "__main__":
     test_version_consistency()
     test_field_presence_and_metric_parsing()
@@ -318,4 +407,9 @@ if __name__ == "__main__":
     test_resilience_budget_and_breaker()
     test_idempotent_obsidian_preservation()
     test_multi_driver_execution()
-    print("\n[√] All 9 comprehensive unit & acceptance tests passed successfully!")
+    test_config_injection_defense()
+    test_credential_isolation_and_url_sanitization()
+    test_csv_formula_injection_defense()
+    test_prefix_collision_defense()
+    test_content_hash_collision_resistance()
+    print("\n[√] All 14 comprehensive unit, acceptance & regression tests passed successfully!")

@@ -81,7 +81,7 @@ class XhsPipeline:
                 pass
         return {
             "active_driver": "mediacrawler",
-            "fallback_driver": "mock",
+            "fallback_driver": None,
             "max_request_budget": 100,
             "rate_limit_per_minute": 30,
             "obsidian_vault_dir": os.environ.get("OBSIDIAN_VAULT_DIR", "./obsidian_cards"),
@@ -125,18 +125,23 @@ class XhsPipeline:
 
         started_at = time.time()
         response: Optional[CrawlResponse] = None
+        actual_driver_used = active_name
 
         try:
             response = await driver.crawl_keywords(request)
             cb.record_success()
+            actual_driver_used = response.driver_name or active_name
         except (RateLimitError, AuthenticationError) as e:
             cb.record_failure()
             if selected_fallback and active_name != selected_fallback:
                 fallback_driver_inst = self.get_driver(selected_fallback)
                 fb_cb = router.get_circuit_breaker(selected_fallback)
                 try:
+                    await self.budget_manager.acquire()
                     response = await fallback_driver_inst.crawl_keywords(request)
                     fb_cb.record_success()
+                    actual_driver_used = selected_fallback
+                    response.driver_name = selected_fallback
                     response.errors.append(f"Primary driver '{active_name}' failed ({str(e)}). Switched to '{selected_fallback}'.")
                 except Exception as fb_err:
                     fb_cb.record_failure()
@@ -151,13 +156,32 @@ class XhsPipeline:
         raw_count = len(response.notes)
         deduped_notes = self.cleaner.deduplicate_notes(response.notes)
         response.notes = deduped_notes
+        response.total_notes = len(deduped_notes)
 
         # Build research reproducibility manifest
+        if not response.success:
+            stop_reason = "failed"
+        elif response.is_partial:
+            stop_reason = "partial_success"
+        else:
+            stop_reason = "completed"
+
+        trails = []
+        for n in deduped_notes:
+            for d in n.discovery_records:
+                trails.append({
+                    "keyword": d.keyword,
+                    "rank": d.rank,
+                    "note_id": n.note_id,
+                    "source_type": d.source_type,
+                    "discovered_at": d.discovered_at
+                })
+
         manifest = CrawlTaskManifest(
             task_id=request.task_id,
-            driver_name=active_name,
-            driver_version="0.3.0",
-            pipeline_version="0.3.0",
+            driver_name=actual_driver_used,
+            driver_version="0.3.1",
+            pipeline_version="0.3.1",
             started_at=started_at,
             completed_at=time.time(),
             keywords=list(request.keywords),
@@ -167,7 +191,9 @@ class XhsPipeline:
             deduplicated_count=len(deduped_notes),
             detail_success_count=len(deduped_notes),
             detail_failed_count=len(response.errors),
-            stop_reason="completed" if response.success else "partial_failure",
+            stop_reason=stop_reason,
+            filter_criteria={"sort_type": request.sort_type, "comments": request.enable_comments},
+            discovery_trails=trails,
             content_hashes={n.note_id: n.content_hash for n in deduped_notes}
         )
         response.manifest = manifest
@@ -250,15 +276,40 @@ class XhsPipeline:
         """
         Delegates atomic Obsidian card generation to ObsidianExporter
         and atomically commits state to CheckpointStore.
+        Skips rewriting when cards on disk are verified unchanged (true idempotence).
         """
         target_dir = vault_dir or self.settings.get("obsidian_vault_dir") or "./obsidian_export"
         exporter = ObsidianExporter(vault_dir=target_dir)
         written_files = []
 
+        reconciled = self.checkpoint_store.reconcile_after_crash(task_id, target_dir, notes)
+
         for note in notes:
+            existing_file = exporter._find_existing_file(note.note_id)
+            if existing_file and reconciled.get(note.note_id) == StageStatus.EXPORTED:
+                written_files.append(existing_file)
+                continue
+
             file_path, written_hash = exporter.export_note(note)
             written_files.append(file_path)
-            # Atomic commit of export state to checkpoint store
-            self.checkpoint_store.commit_export(task_id, note.note_id, file_path, written_hash)
+            self.checkpoint_store.commit_export(
+                task_id=task_id,
+                note_id=note.note_id,
+                file_path=file_path,
+                source_hash=note.content_hash,
+                artifact_hash=written_hash
+            )
 
         return written_files
+
+    def save_state(self, notes: List[UnifiedNote], file_path: str) -> str:
+        """Atomically saves pipeline execution state to JSON."""
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+        payload = [n.to_dict() for n in notes]
+        temp_file = f"{file_path}.{os.getpid()}_{time.time_ns()}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, file_path)
+        return file_path

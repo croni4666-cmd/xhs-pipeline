@@ -36,7 +36,7 @@ async def main():
     parser.add_argument("--keywords", "-k", type=str, default="", help="Comma-separated keywords")
     parser.add_argument("--limit", "-l", type=int, default=20, help="Max notes per keyword")
     parser.add_argument("--driver", "-d", type=str, default="mediacrawler", help="Scraper driver (mediacrawler | http | mock)")
-    parser.add_argument("--fallback-driver", type=str, default="mock", help="Fallback driver if primary circuit breaker trips")
+    parser.add_argument("--fallback-driver", type=str, default="", help="Fallback driver if primary circuit breaker trips (default: none)")
     parser.add_argument("--max-budget", type=int, default=100, help="Maximum request budget")
     parser.add_argument("--rate-limit", type=int, default=30, help="Rate limit per minute")
     parser.add_argument("--resume-from", "-r", type=str, default="", help="Resume downstream processing from raw JSONL file")
@@ -201,8 +201,24 @@ async def main():
     else:
         print("[*] Pipeline finished successfully.")
 
-    sys.exit(0 if not is_partial else 1)
+    if len(notes) == 0 and crawl_errors:
+        sys.exit(2)
+    elif is_partial:
+        sys.exit(1)
+    else:
+        sys.exit(0)
+
+
+def cli_entrypoint():
+    """Synchronous entrypoint wrapper for setuptools console scripts."""
+    try:
+        asyncio.run(main())
+    except SystemExit as e:
+        sys.exit(e.code)
+    except Exception as e:
+        sys.stderr.write(f"Fatal error: {e}\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    cli_entrypoint()

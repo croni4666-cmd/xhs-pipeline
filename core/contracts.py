@@ -13,10 +13,19 @@ Unified, type-safe schema strictly separating:
 
 import time
 import re
+import json
 import hashlib
 from enum import Enum
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Optional, Tuple, Union
+
+
+def sanitize_note_url(raw_url: str) -> str:
+    """Strips query parameters (?xsec_token=..., etc.) and fragments from note URLs."""
+    if not raw_url:
+        return ""
+    clean = raw_url.split("?")[0].split("#")[0].strip()
+    return clean
 
 
 # =====================================================================
@@ -281,9 +290,18 @@ class ContentFact:
     content_hash: str = ""
 
     def __post_init__(self):
+        if self.source_url:
+            self.source_url = sanitize_note_url(self.source_url)
         if not self.content_hash:
-            raw_data = f"{self.title}|{self.desc}".encode("utf-8")
-            self.content_hash = hashlib.sha256(raw_data).hexdigest()[:16]
+            norm_payload = json.dumps({
+                "v": "fact_v1",
+                "title": self.title,
+                "desc": self.desc,
+                "author_id": self.author_id,
+                "note_type": self.note_type,
+                "tags": sorted(self.tag_list)
+            }, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            self.content_hash = hashlib.sha256(norm_payload).hexdigest()
 
 
 # =====================================================================
@@ -341,6 +359,10 @@ class UnifiedNote:
     crawled_at: float = field(default_factory=time.time)
     stage_status: StageStatus = StageStatus.CRAWLED
 
+    def __post_init__(self):
+        if self.url:
+            self.url = sanitize_note_url(self.url)
+
     @property
     def primary_keyword(self) -> str:
         for d in self.discovery_records:
@@ -372,12 +394,26 @@ class UnifiedNote:
     def content_hash(self) -> str:
         return self.fact.content_hash
 
-    def add_discovery(self, keyword: Optional[str] = None, rank: Optional[int] = None, source_type: str = "search_keyword"):
+    def add_discovery(
+        self,
+        keyword: Optional[str] = None,
+        rank: Optional[int] = None,
+        source_type: str = "search_keyword",
+        discovered_at: Optional[float] = None
+    ):
         """Append a discovery pathway without overwriting previous associations."""
+        ts = discovered_at if discovered_at is not None else time.time()
         for rec in self.discovery_records:
             if rec.keyword == keyword and rec.source_type == source_type:
+                if rank is not None and rec.rank is None:
+                    rec.rank = rank
                 return
-        self.discovery_records.append(DiscoveryRecord(source_type=source_type, keyword=keyword, rank=rank))
+        self.discovery_records.append(DiscoveryRecord(
+            source_type=source_type,
+            keyword=keyword,
+            rank=rank,
+            discovered_at=ts
+        ))
 
     def add_insight(self, insight: ContentInsight):
         """Attach a decoupled traceable analytical insight."""

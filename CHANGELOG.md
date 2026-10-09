@@ -5,6 +5,26 @@
 
 ---
 
+## [0.3.1rc2] - 2026-10-09
+
+### 🛡️ 架构与安全全面加固 (Rigorous Hardening & Security Isolation)
+
+系统性修复预发布工程审查报告（F01-F07）发现的所有阻塞项：
+
+#### 🔒 Security & Credential Isolation (安全与凭证隔离)
+- **F01 修复（防止配置注入）**：MediaCrawler 配置写入全面使用安全字面量编码（`json.dumps`），并强制通过 `ast.parse` 抽象语法树校验，杜绝恶意字符串逃逸为可执行代码。
+- **F02 修复（凭证边界封堵）**：引入统一 URL 规范化函数 `sanitize_note_url`，去除所有 `xsec_token` 等查询参数；非跨进程恢复凭证禁止保存至持久化 JSON；错误输出（stderr）全面实施敏感路径与 Token 脱敏。
+- **CSV 公式注入防御**：导出表格时对以 `=`, `+`, `-`, `@` 起始的文本字段自动转义，防止电子表格软件解析为可执行宏公式。
+
+#### 📦 Architecture & Reliability (架构完备性与真实性保证)
+- **F03 修复（驱动能力声明与真实保证）**：修正 `MediaCrawlerDriver` 详情能力声明（`can_get_detail = False`）；`HttpCrawlerDriver` 采用确定性 SHA-256 派生 ID；生产环境默认关闭自动向 mock 回退。
+- **F04 修复（对账恢复完整性）**：重构 `reconcile_after_crash`，强制核查磁盘文件真实存在性、正文完整结构与内容指纹；统一 Windows 平台 LF 字节写入与完整 64 位 SHA-256 渲染对账；将对账逻辑贯穿至正常导出流程。
+- **F05 修复（人工批注强保护）**：严格精确匹配 `XHS_{note_id}.md` 文件，彻底杜绝短 ID 前缀碰撞；采用尾部反向分割（`rsplit`）提取人工批注；现有卡片读取失败时阻断覆盖，确保数据不丢失。
+- **F06 修复（元数据原子化写入）**：任务清单、引用列表与提交日志全面采用基于 PID 与纳秒时间戳的唯一临时文件原子写入（`flush + fsync + os.replace`），彻底消除写入中断致空文件截断隐患。
+- **F07 修复（发布包与 CLI 入口）**：显式配置 `tool.setuptools.packages.find` 支持平铺布局构建 Wheel；提供同步包装入口 `cli_entrypoint` 解决 CLI 报错；实现 `save_state`；采集失败依据结果退出码返回非零状态。
+
+---
+
 ## [0.3.0] - 2026-10-08
 
 ### 🔬 实体、上下文与任务状态深度分离 (Deep Separation of Entities, Context & State)

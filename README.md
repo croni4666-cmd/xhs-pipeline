@@ -1,14 +1,14 @@
-# 📕 xhs-pipeline (v0.3.0)
+# 📕 xhs-pipeline (v0.3.1-rc2)
 
 > **工业级、开放式、严格区分“内容实体/采集上下文/任务状态”的小红书（Xiaohongshu）AI Agent 自动化研究与知识资产化管线。**  
 > *Industrial-grade Xiaohongshu Research, Context-Decoupled Multi-Driver Architecture, Academic Reproducibility & Obsidian PKM Pipeline.*
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-0.3.1rc2-blue.svg)](VERSION)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![Architecture](https://img.shields.io/badge/architecture-Context%20Decoupled-orange)](ARCHITECTURE.md)
-[![Tests](https://img.shields.io/badge/tests-9%20passing-brightgreen)](tests/test_pipeline.py)
-[![Conformance](https://img.shields.io/badge/conformance-multi--driver%20verified-brightgreen)](tests/test_conformance.py)
+[![Tests](https://img.shields.io/badge/tests-19%20passing-brightgreen)](tests/)
+[![Security](https://img.shields.io/badge/security-hardened-green)](tests/test_audit_probes.py)
 
 ---
 
@@ -18,7 +18,7 @@
 
 ```
 xhs-pipeline/
-├── VERSION                         # [版本声明] 单一真实来源的语义化版本标识 (0.3.0)
+├── VERSION                         # [版本声明] 单一真实来源的语义化版本标识 (0.3.1rc2)
 ├── CHANGELOG.md                    # [变更日志] 遵循 Keep a Changelog 规范的演进历史
 ├── LICENSE                         # [开源许可] MIT 许可证
 ├── pyproject.toml                  # [打包配置] 遵循 PEP 621 标准的 Python 项目打包与 CLI 声明
@@ -77,14 +77,19 @@ xhs-pipeline/
 - **无僵尸进程**：当用户或 Agent 中断任务时，自动安全终结（`terminate()`/`kill()`）后台爬虫子进程并释放调试端口句柄，正确重新抛出取消异常。
 
 ### 5. 原子持久化与崩溃一致性对账 (Crash Consistency)
-- **修订方案**：`ObsidianExporter` 采用写入临时文件并刷盘原子重命名机制（`.tmp` -> `os.replace`），杜绝半写损坏。
-- **崩溃对账**：`CheckpointStore` 在重启后根据卡片中的 SHA-256 `content_hash` 指纹进行对账。文件已存在且哈希吻合时自动提交检查点，绝不产生重复卡片或漏写。
+- **修订方案**：`ObsidianExporter` 采用写入唯一临时文件并刷盘原子重命名机制（`.tmp` -> `os.replace`），消除并发与写入中断损坏风险。
+- **崩溃对账**：`CheckpointStore` 在重启后根据卡片中的 SHA-256 `content_hash` 指纹与正文完整结构进行对账。文件已存在且哈希吻合时确认检查点，防止重复覆盖并严格保留用户人工批注。
 
 ### 6. 研究复现任务清单 (`CrawlTaskManifest`)
 - **修订方案**：引入 `CrawlTaskManifest`，不仅保存笔记，更保存完整检索条件（关键词、排序、过滤规则）、配额上限、实际发现数、去重数、详情成功率及内容版本哈希字典。
-- **消除选择偏差**：完整解释“为什么选中了这些内容”，提供 100% 可复现的实证研究审计追踪。
+- **消除选择偏差**：完整记录“为什么选中了这些内容”，为实证研究与文献计量提供透明、可追溯的审计追踪。
 
-### 7. Pipeline 职责拆解，防止单体膨胀
+### 7. 安全防御与凭证边界封堵
+- **配置防注入**：配置参数强制经由安全字面量编码与 AST 抽象语法树校验，杜绝注入。
+- **URL 与凭证隔离**：全链路规范化清除 URL 中的敏感令牌；非跨进程凭证不落盘。
+- **CSV 公式转义**：表格导出对特殊公式前缀（`=`, `+`, `-`, `@`）自动转义。
+
+### 8. Pipeline 职责拆解，防止单体膨胀
 - **修订方案**：`XhsPipeline` 剥离为轻量级流程与状态协调器，具体逻辑委托给独立组件：
   - 数据清洗与去重：`DataCleaner`
   - 资产持久化与原子写入：`ObsidianExporter` / `CsvExporter`
@@ -97,11 +102,8 @@ xhs-pipeline/
 
 ### 1. 运行自检与合规测试
 ```bash
-# 运行 9 项管线综合测试（版本、缺失语义、多词去重、崩溃对账、复现清单）
-python tests/test_pipeline.py
-
-# 运行通用驱动一致性合规测试（测试引用失效与取消语义）
-python tests/test_conformance.py
+# 运行全部 19 项单元测试、契约合规与审计探针测试
+pytest -v
 ```
 
 ### 2. 执行关键词采集并导出复现清单与 Obsidian 卡片
