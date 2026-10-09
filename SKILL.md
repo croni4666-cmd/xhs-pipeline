@@ -16,7 +16,7 @@ triggers:
   - xiaohongshu skill
 ---
 
-# 📕 xhs-pipeline: 小红书智能研究与资产化管线 (v0.3.1-rc2)
+# 📕 xhs-pipeline: 小红书智能研究与资产化管线 (v0.3.2-rc3)
 
 遵循**工业级软件工程标准**与**学术可复现性规范**构建的小红书自动化数据与知识沉淀 Skill。
 

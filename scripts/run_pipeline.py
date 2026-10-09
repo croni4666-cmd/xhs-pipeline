@@ -87,6 +87,7 @@ async def main():
     notes = []
     crawl_errors = []
     is_partial = False
+    crawl_success = True
 
     # 2. Failure Recovery Mode (Resume from file)
     if args.resume_from:
@@ -124,6 +125,7 @@ async def main():
             notes = response.notes
             crawl_errors = response.errors
             is_partial = response.is_partial
+            crawl_success = response.success
             if args.format != "json":
                 print(f"[√] Crawl completed! Total notes fetched: {response.total_notes}")
                 if crawl_errors:
@@ -186,10 +188,15 @@ async def main():
         if args.format != "json":
             print(f"[√] Pipeline stage state saved to: {args.state_file}")
 
+    # Determine overall execution outcome strictly based on crawl_success
+    overall_success = bool(crawl_success and not (len(notes) == 0 and (crawl_errors or not crawl_success)))
+    if not crawl_success:
+        overall_success = False
+
     # Output structured JSON if requested
     if args.format == "json":
         result = {
-            "success": len(notes) > 0,
+            "success": overall_success,
             "total_notes": len(notes),
             "is_partial": is_partial,
             "errors": crawl_errors,
@@ -199,9 +206,12 @@ async def main():
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print("[*] Pipeline finished successfully.")
+        if overall_success:
+            print("[*] Pipeline finished successfully.")
+        else:
+            print("[!] Pipeline completed with errors or failure.")
 
-    if len(notes) == 0 and crawl_errors:
+    if not overall_success:
         sys.exit(2)
     elif is_partial:
         sys.exit(1)

@@ -74,14 +74,22 @@ class CheckpointStore:
         path = self._get_ref_path(task_id)
         payload = []
         for r in refs:
-            is_resumable = bool(r.can_resume_cross_process and not r.is_expired())
+            # Sensitive auth secrets/cookies are NEVER written to plaintext JSON disk!
+            safe_context = {}
+            if isinstance(r.access_context, dict):
+                for k, v in r.access_context.items():
+                    k_lower = str(k).lower()
+                    if any(secret_kw in k_lower for secret_kw in ("cookie", "token", "auth", "secret", "key", "password", "session")):
+                        continue
+                    safe_context[k] = v
+
             payload.append({
                 "note_id": r.note_id,
                 "driver_name": r.driver_name,
                 "title_hint": r.title_hint,
                 "author_hint": r.author_hint,
-                "access_token": r.access_token if is_resumable else "",
-                "access_context": r.access_context if is_resumable else {},
+                "access_token": "",  # Never persist plaintext secrets to disk sink
+                "access_context": safe_context,
                 "discovered_keyword": r.discovered_keyword,
                 "rank": r.rank,
                 "created_at": r.created_at,
@@ -140,12 +148,13 @@ class CheckpointStore:
         note_id: str,
         file_path: str,
         source_hash: str,
-        artifact_hash: str = ""
+        artifact_hash: str = "",
+        render_input_hash: str = ""
     ) -> None:
         """
         Atomically commits the exported card state AFTER file write has completed.
         Ensures consistency between filesystem and checkpoint state.
-        Records both source_hash and artifact_hash.
+        Records source_hash, artifact_hash, and render_input_hash.
         """
         log_path = self._get_commit_log_path(task_id)
         commits: Dict[str, Any] = {}
@@ -165,17 +174,28 @@ class CheckpointStore:
             "source_hash": source_hash,
             "content_hash": source_hash,
             "artifact_hash": artifact_hash,
+            "render_input_hash": render_input_hash,
             "committed_at": time.time(),
             "status": StageStatus.EXPORTED.value
         }
         self._atomic_write_json(log_path, commits)
 
+    def get_commit(self, task_id: str, note_id: str) -> Optional[Dict[str, Any]]:
+        log_path = self._get_commit_log_path(task_id)
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    commits = json.load(f)
+                return commits.get(note_id)
+            except Exception:
+                pass
+        return None
+
     def reconcile_after_crash(self, task_id: str, vault_dir: str, notes: List[UnifiedNote]) -> Dict[str, StageStatus]:
         """
         Reconciles crash inconsistency with strict verification:
-        1. If committed: verifies file exists on disk and source content hash matches.
-        2. If uncommitted: checks for existing valid card on disk, verifies body integrity and content hash.
-        3. Prevents prefix collisions (exact note_id matching).
+        1. If committed: verifies file exists, matches disk artifact hash, and matches render inputs.
+        2. If uncommitted: verifies exact frontmatter, heading, and body in fact section.
         """
         log_path = self._get_commit_log_path(task_id)
         commits: Dict[str, Any] = {}
@@ -194,52 +214,79 @@ class CheckpointStore:
                 card_file = commit_info.get("file_path", "")
                 committed_source = commit_info.get("source_hash") or commit_info.get("content_hash", "")
                 committed_artifact = commit_info.get("artifact_hash", "")
+                committed_render = commit_info.get("render_input_hash", "")
 
                 # Verify file actually exists on disk
-                if card_file and os.path.exists(card_file):
-                    # Verify content hasn't changed since commit
-                    if committed_source == note.content_hash or (committed_artifact and committed_artifact == note.content_hash):
-                        stage_map[note.note_id] = StageStatus.EXPORTED
-                        note.stage_status = StageStatus.EXPORTED
-                        continue
-                    else:
-                        # Content was updated, needs re-export
+                if card_file and os.path.isfile(card_file):
+                    try:
+                        disk_bytes = Path(card_file).read_bytes()
+                        disk_artifact_hash = hashlib.sha256(disk_bytes).hexdigest()
+                    except OSError:
+                        disk_bytes = b""
+                        disk_artifact_hash = ""
+
+                    # Verify disk file hash matches artifact_hash if recorded
+                    if committed_artifact and disk_artifact_hash != committed_artifact:
+                        # File was tampered, truncated, or replaced!
                         note.stage_status = StageStatus.CRAWLED
                         stage_map[note.note_id] = StageStatus.CRAWLED
                         continue
+
+                    # Verify source content hasn't changed
+                    if committed_source != note.content_hash and committed_artifact != note.content_hash:
+                        note.stage_status = StageStatus.CRAWLED
+                        stage_map[note.note_id] = StageStatus.CRAWLED
+                        continue
+
+                    # Verify render inputs (metrics, discovery, insights, author, etc.) haven't changed
+                    if committed_render and hasattr(note, "get_render_input_hash") and committed_render != note.get_render_input_hash():
+                        note.stage_status = StageStatus.CRAWLED
+                        stage_map[note.note_id] = StageStatus.CRAWLED
+                        continue
+
+                    stage_map[note.note_id] = StageStatus.EXPORTED
+                    note.stage_status = StageStatus.EXPORTED
+                    continue
                 else:
                     # File was deleted on disk! Cannot mark as EXPORTED
                     note.stage_status = StageStatus.CRAWLED
                     stage_map[note.note_id] = StageStatus.CRAWLED
                     continue
 
-            # 2. Check uncommitted file on disk (with exact prefix regex to prevent collisions)
-            safe_id = re.escape(note.note_id)
-            id_pattern = re.compile(rf"^XHS_{safe_id}(_.*)?\.md$")
-            matches = [
-                str(p) for p in Path(vault_dir).iterdir()
-                if p.is_file() and id_pattern.match(p.name)
-            ] if os.path.exists(vault_dir) else []
+            # 2. Check uncommitted file on disk
+            target_token = f'note_id: "{note.note_id}"'
+            found_file = None
+            if os.path.exists(vault_dir):
+                for p in Path(vault_dir).glob("XHS_*.md"):
+                    if p.is_file() and (p.name == f"XHS_{note.note_id}.md" or p.name.startswith(f"XHS_{note.note_id}_")):
+                        try:
+                            text = p.read_text(encoding="utf-8")
+                            # Verify frontmatter note_id and content_hash
+                            if target_token in text and f'content_hash: "{note.content_hash}"' in text:
+                                # Verify document structure: title heading, fact section, and body placement
+                                if f"# {note.title}" in text and "### 📝 笔记事实正文" in text:
+                                    body_part = text.split("### 📝 笔记事实正文", 1)[1]
+                                    fact_body = body_part.split("## 📝 我的批注与研究笔记", 1)[0] if "## 📝 我的批注与研究笔记" in body_part else body_part
+                                    if (not note.desc) or (note.get_sanitized_desc() in fact_body):
+                                        found_file = str(p)
+                                        disk_hash = hashlib.sha256(p.read_bytes()).hexdigest()
+                                        render_hash = note.get_render_input_hash() if hasattr(note, "get_render_input_hash") else ""
+                                        self.commit_export(
+                                            task_id=task_id,
+                                            note_id=note.note_id,
+                                            file_path=found_file,
+                                            source_hash=note.content_hash,
+                                            artifact_hash=disk_hash,
+                                            render_input_hash=render_hash
+                                        )
+                                        stage_map[note.note_id] = StageStatus.EXPORTED
+                                        note.stage_status = StageStatus.EXPORTED
+                                        break
+                        except Exception:
+                            pass
 
-            if matches:
-                existing_file = matches[0]
-                try:
-                    with open(existing_file, "r", encoding="utf-8") as f:
-                        text = f.read()
-
-                    # Verify header, content_hash and body integrity (not just a stub content_hash line)
-                    has_hash = f'content_hash: "{note.content_hash}"' in text
-                    has_body = (not note.desc) or (note.desc in text)
-                    has_frontmatter = text.startswith("---") and "\n---" in text[3:]
-
-                    if has_hash and has_body and has_frontmatter:
-                        # Valid file recovered from crash! Register commit and mark EXPORTED
-                        self.commit_export(task_id, note.note_id, existing_file, note.content_hash)
-                        stage_map[note.note_id] = StageStatus.EXPORTED
-                        note.stage_status = StageStatus.EXPORTED
-                        continue
-                except Exception:
-                    pass
+            if found_file:
+                continue
 
             note.stage_status = StageStatus.CRAWLED
             stage_map[note.note_id] = note.stage_status

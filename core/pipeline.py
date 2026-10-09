@@ -60,6 +60,7 @@ class XhsPipeline:
         state_dir = self.settings.get("checkpoint_dir", "./data/checkpoints")
         self.checkpoint_store = CheckpointStore(state_dir=state_dir)
         self.cleaner = DataCleaner()
+        self.router: Optional[DriverFallbackRouter] = None
 
         self._register_default_drivers()
 
@@ -116,9 +117,17 @@ class XhsPipeline:
         await self.budget_manager.acquire()
 
         selected_primary = driver_name or self.settings.get("active_driver", "mediacrawler")
-        selected_fallback = fallback_driver or self.settings.get("fallback_driver")
+        selected_fallback = fallback_driver if fallback_driver is not None else self.settings.get("fallback_driver")
+        if not selected_fallback:
+            selected_fallback = None
 
-        router = DriverFallbackRouter(primary_driver=selected_primary, fallback_driver=selected_fallback)
+        if not hasattr(self, "router") or self.router is None:
+            self.router = DriverFallbackRouter(primary_driver=selected_primary, fallback_driver=selected_fallback)
+        else:
+            self.router.primary_driver = selected_primary
+            self.router.fallback_driver = selected_fallback
+
+        router = self.router
         active_name = router.select_healthy_driver()
         driver = self.get_driver(active_name)
         cb = router.get_circuit_breaker(active_name)
@@ -180,8 +189,8 @@ class XhsPipeline:
         manifest = CrawlTaskManifest(
             task_id=request.task_id,
             driver_name=actual_driver_used,
-            driver_version="0.3.1",
-            pipeline_version="0.3.1",
+            driver_version="0.3.2rc3",
+            pipeline_version="0.3.2rc3",
             started_at=started_at,
             completed_at=time.time(),
             keywords=list(request.keywords),
@@ -189,8 +198,8 @@ class XhsPipeline:
             request_quota=request.max_count_per_keyword * len(request.keywords),
             actual_discovered_count=raw_count,
             deduplicated_count=len(deduped_notes),
-            detail_success_count=len(deduped_notes),
-            detail_failed_count=len(response.errors),
+            detail_success_count=0,
+            detail_failed_count=0,
             stop_reason=stop_reason,
             filter_criteria={"sort_type": request.sort_type, "comments": request.enable_comments},
             discovery_trails=trails,
@@ -287,17 +296,30 @@ class XhsPipeline:
         for note in notes:
             existing_file = exporter._find_existing_file(note.note_id)
             if existing_file and reconciled.get(note.note_id) == StageStatus.EXPORTED:
-                written_files.append(existing_file)
-                continue
+                # Double-check that disk file has not been tampered
+                commit_info = self.checkpoint_store.get_commit(task_id, note.note_id) if hasattr(self.checkpoint_store, "get_commit") else None
+                if commit_info and commit_info.get("artifact_hash"):
+                    try:
+                        cur_disk_hash = hashlib.sha256(Path(existing_file).read_bytes()).hexdigest()
+                        if cur_disk_hash != commit_info["artifact_hash"]:
+                            existing_file = None
+                    except OSError:
+                        existing_file = None
+
+                if existing_file:
+                    written_files.append(existing_file)
+                    continue
 
             file_path, written_hash = exporter.export_note(note)
             written_files.append(file_path)
+            render_hash = note.get_render_input_hash() if hasattr(note, "get_render_input_hash") else ""
             self.checkpoint_store.commit_export(
                 task_id=task_id,
                 note_id=note.note_id,
                 file_path=file_path,
                 source_hash=note.content_hash,
-                artifact_hash=written_hash
+                artifact_hash=written_hash,
+                render_input_hash=render_hash
             )
 
         return written_files

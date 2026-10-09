@@ -1,6 +1,6 @@
 {
   "active_driver": "mediacrawler",
-  "fallback_driver": "mock",
+  "fallback_driver": null,
   "mediacrawler_path": "./MediaCrawler",
   "python_path": "python",
   "cdp_port": 9222,

@@ -1,13 +1,13 @@
-# 📕 xhs-pipeline (v0.3.1-rc2)
+# 📕 xhs-pipeline (v0.3.2-rc3)
 
 > **工业级、开放式、严格区分“内容实体/采集上下文/任务状态”的小红书（Xiaohongshu）AI Agent 自动化研究与知识资产化管线。**  
 > *Industrial-grade Xiaohongshu Research, Context-Decoupled Multi-Driver Architecture, Academic Reproducibility & Obsidian PKM Pipeline.*
 
-[![Version](https://img.shields.io/badge/version-0.3.1rc2-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-0.3.2rc3-blue.svg)](VERSION)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![Architecture](https://img.shields.io/badge/architecture-Context%20Decoupled-orange)](ARCHITECTURE.md)
-[![Tests](https://img.shields.io/badge/tests-19%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-22%20passing-brightgreen)](tests/)
 [![Security](https://img.shields.io/badge/security-hardened-green)](tests/test_audit_probes.py)
 
 ---
@@ -18,7 +18,7 @@
 
 ```
 xhs-pipeline/
-├── VERSION                         # [版本声明] 单一真实来源的语义化版本标识 (0.3.1rc2)
+├── VERSION                         # [版本声明] 单一真实来源的语义化版本标识 (0.3.2rc3)
 ├── CHANGELOG.md                    # [变更日志] 遵循 Keep a Changelog 规范的演进历史
 ├── LICENSE                         # [开源许可] MIT 许可证
 ├── pyproject.toml                  # [打包配置] 遵循 PEP 621 标准的 Python 项目打包与 CLI 声明

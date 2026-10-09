@@ -3,6 +3,44 @@
 本项目遵循 [语义化版本 2.0.0 (Semantic Versioning)](https://semver.org/lang/zh-CN/) 规范。  
 变更日志格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [0.3.2rc3] - 2026-10-09
+
+### 🛡️ 审查闭环加固与完整性保证 (Comprehensive Audit Closure & Integrity Hardening)
+
+系统性响应 GPT 第二轮复审报告（F01–F07 残留项），彻底消除所有 P1 级安全与数据一致性隐患，完善 P2 级健壮性契约：
+
+#### 🔒 Security & Credential Boundary (安全注入封堵与凭证完全隔离)
+- **F01 终结（多轮配置注入彻底封堵）**：
+  - MediaCrawler `base_config.py` 改用行首至行尾的多行模式全行替换（`(?m)^[ \t]*KEYWORDS\s*=.*$`）配合 `lambda` 纯字面量返回，彻底解决由于字符串转义引号导致的早停与 Python 语句注入逃逸问题。
+  - 新增多轮注入复查探针，经 AST 深度验证无任何变量名外溢。
+- **F02 终结（凭证完全隔离与敏感数据脱敏）**：
+  - 零凭证落盘原则：引用持久化（`save_references`）全面剔除敏感令牌及会话凭据（自动过滤 `cookie`, `token`, `auth`, `secret`, `key` 等敏感字段，`access_token` 不再写入持久化 JSON）。
+  - 图片列表（`image_list`）与视频链接（`video_url`）全面应用 `sanitize_note_url` 净化，消除媒体 URL 泄露 `xsec_token` 的隐蔽路径。
+  - 错误信息脱敏（`_sanitize_error_msg`）全面支持大小写不敏感匹配、JSON 键值对格式与等号/冒号 Cookie 捕获。
+
+#### 📦 Data Authenticity & Contract Integrity (数据真实性与生产门禁)
+- **F03 终结（模拟模式显式标注与回退门禁）**：
+  - `config/settings.example.json` 与默认配置模板中 `fallback_driver` 彻底改为 `null`，生产环境严格禁止隐式/无感知回退到 mock。
+  - `HttpCrawlerDriver` 显式标注 `is_synthetic = True` 与 `data_source = "synthetic_simulation"`，搜索与详情均透明标识为模拟生成，不再以真实采集数据自称。
+  - 发现记录明确保留搜索排名 `rank` 并在 Manifest 中完整持久化。
+
+#### 🔄 Idempotence, Annotations & Reconciliation (幂等对账与人工批注强保护)
+- **F04 终结（卡片篡改自愈与全量输入渲染指纹）**：
+  - `reconcile_after_crash` 强制校验已提交文件的磁盘二进制 SHA-256 哈希值；若卡片被外部破坏、截断或篡改，绝不再误判为 `EXPORTED`，自动触发重新导出并修复。
+  - 引入全量渲染输入哈希（`get_render_input_hash`），囊括点赞指标变化、发现关键词追加、分析洞察更新等所有可渲染元素；指标或结论变化时准确触发重写，不再被 `source_hash` 错误跳过。
+  - 无提交日志的崩溃卡片恢复强化验证：严格校验 Frontmatter `note_id`、`content_hash`、文章一级标题与正文区块位置，拒绝伪造或格式不全的骨架卡片。
+- **F05 终结（人工批注绝对保护与文件名歧义消除）**：
+  - 引入结构化保护注释 `<!-- BEGIN_USER_NOTES -->` 与 `<!-- END_USER_NOTES -->`，即使用户在人工批注区再次引用同名 Markdown 标题，全文批注均完整无损保留。
+  - 旧卡片兼容与保护：存在但无指定标头的已有卡片内容自动沉淀至人工批注区，绝不静默覆盖。
+  - 卡片文件查找严格比对 Frontmatter `note_id: "{note_id}"`，彻底消除包含下划线的笔记 ID（如 `abc` 与 `abc_def`）之间的前缀路径冲突。
+
+#### 🚀 CLI Contract & Resilience (CLI 失败状态码一致性与熔断持久化)
+- **F06 优化（并发元数据保护）**：
+  - Checkpoint 提交日志全面采用安全隔离与异常捕获，损坏文件自动归档至 `.corrupt_*` 并不中断服务。
+- **F07 终结（CLI 退出契约一致性）**：
+  - CLI `main` 与 JSON 输出严格绑定 `CrawlResponse.success`；采集失败即使存在部分脏数据，或无诊断信息返回，均稳定退出非零状态码（exit 2）并输出 `"success": false`。
+  - 跨任务熔断状态持久化：`XhsPipeline` 维护长生命周期 `router`，确保熔断器状态在多次任务调用间保持连续有效。
+
 ---
 
 ## [0.3.1rc2] - 2026-10-09

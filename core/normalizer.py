@@ -45,10 +45,20 @@ class DataCleaner:
                 # Upgrade title if new one is more informative
                 if (not existing.title or len(note.title) > len(existing.title)) and note.title:
                     existing.title = note.title
-                # Upgrade desc and completeness if new note has fuller description
-                if (existing.completeness != ContentCompleteness.FULL and note.completeness == ContentCompleteness.FULL) or \
-                   (existing.desc_presence != FieldPresence.VALID and note.desc_presence == FieldPresence.VALID) or \
-                   (len(note.desc.strip()) > len(existing.desc.strip())):
+                # Upgrade desc and completeness: never downgrade from FULL to TRUNCATED or EMPTY!
+                should_upgrade_desc = False
+                if existing.completeness != ContentCompleteness.FULL:
+                    if note.completeness == ContentCompleteness.FULL:
+                        should_upgrade_desc = True
+                    elif existing.desc_presence != FieldPresence.VALID and note.desc_presence == FieldPresence.VALID:
+                        should_upgrade_desc = True
+                    elif note.completeness != ContentCompleteness.EMPTY and len(note.desc.strip()) > len(existing.desc.strip()):
+                        should_upgrade_desc = True
+                else:
+                    if note.completeness == ContentCompleteness.FULL and len(note.desc.strip()) > len(existing.desc.strip()):
+                        should_upgrade_desc = True
+
+                if should_upgrade_desc:
                     existing.desc = note.desc
                     existing.desc_presence = note.desc_presence
                     existing.completeness = note.completeness

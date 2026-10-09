@@ -99,11 +99,13 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
             return False
 
     def _sanitize_error_msg(self, msg: str) -> str:
-        msg = re.sub(r'xsec_token=[a-zA-Z0-9_\-]+', 'xsec_token=[REDACTED]', msg)
-        msg = re.sub(r'(Bearer\s+)[a-zA-Z0-9_\.\-]+', r'\1[REDACTED]', msg)
-        msg = re.sub(r'cookie:[^\r\n]+', 'cookie: [REDACTED]', msg, flags=re.IGNORECASE)
-        msg = re.sub(r'[A-Za-z]:\\[^ \t\r\n]+', '[REDACTED_PATH]', msg)
-        msg = re.sub(r'/(?:home|Users)/[^ \t\r\n]+', '[REDACTED_PATH]', msg)
+        # Redact xsec_token in key=value, key: value, or JSON "key": "value" (case-insensitive)
+        msg = re.sub(r'(?i)(["\']?xsec_token["\']?\s*[:=]\s*["\']?)[a-zA-Z0-9_\-]+(["\']?)', r'\g<1>[REDACTED]\g<2>', msg)
+        msg = re.sub(r'(?i)(Bearer\s+)[a-zA-Z0-9_\.\-]+', r'\1[REDACTED]', msg)
+        # Redact cookies in cookie: value, cookie=value, or JSON "cookie": "value" (case-insensitive)
+        msg = re.sub(r'(?i)(["\']?cookie["\']?\s*[:=]\s*["\']?)[^\r\n"\'\},]+(["\']?)', r'\g<1>[REDACTED]\g<2>', msg)
+        msg = re.sub(r'[A-Za-z]:\\[^ \t\r\n"\']+', '[REDACTED_PATH]', msg)
+        msg = re.sub(r'/(?:home|Users)/[^ \t\r\n"\']+', '[REDACTED_PATH]', msg)
         return msg
 
     def _configure_mediacrawler(self, request: CrawlRequest) -> None:
@@ -118,12 +120,13 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         safe_count = int(request.max_count_per_keyword)
         safe_comments = bool(request.enable_comments)
 
-        content = re.sub(r'KEYWORDS\s*=\s*["\'].*?["\']', lambda _: f'KEYWORDS = {safe_kw_literal}', content)
-        content = re.sub(r'CRAWLER_MAX_NOTES_COUNT\s*=\s*\d+', lambda _: f'CRAWLER_MAX_NOTES_COUNT = {safe_count}', content)
-        content = re.sub(r'ENABLE_GET_COMMENTS\s*=\s*(True|False)', lambda _: f'ENABLE_GET_COMMENTS = {safe_comments}', content)
-        content = re.sub(r'ENABLE_CDP_MODE\s*=\s*(True|False)', 'ENABLE_CDP_MODE = True', content)
-        content = re.sub(r'CDP_CONNECT_EXISTING\s*=\s*(True|False)', 'CDP_CONNECT_EXISTING = True', content)
-        content = re.sub(r'AUTO_CLOSE_BROWSER\s*=\s*(True|False)', 'AUTO_CLOSE_BROWSER = False', content)
+        # Full-line multiline replacement prevents any escaped-quote statement injection
+        content = re.sub(r'(?m)^[ \t]*KEYWORDS\s*=.*$', lambda _: f'KEYWORDS = {safe_kw_literal}', content)
+        content = re.sub(r'(?m)^[ \t]*CRAWLER_MAX_NOTES_COUNT\s*=.*$', lambda _: f'CRAWLER_MAX_NOTES_COUNT = {safe_count}', content)
+        content = re.sub(r'(?m)^[ \t]*ENABLE_GET_COMMENTS\s*=.*$', lambda _: f'ENABLE_GET_COMMENTS = {safe_comments}', content)
+        content = re.sub(r'(?m)^[ \t]*ENABLE_CDP_MODE\s*=.*$', lambda _: 'ENABLE_CDP_MODE = True', content)
+        content = re.sub(r'(?m)^[ \t]*CDP_CONNECT_EXISTING\s*=.*$', lambda _: 'CDP_CONNECT_EXISTING = True', content)
+        content = re.sub(r'(?m)^[ \t]*AUTO_CLOSE_BROWSER\s*=.*$', lambda _: 'AUTO_CLOSE_BROWSER = False', content)
 
         # Syntax AST validation to ensure no code injection
         try:
@@ -200,23 +203,21 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         if not os.path.exists(data_dir):
             return CrawlResponse(success=True, driver_name=self.name, total_notes=0, notes=[])
 
-        # Isolate candidate files created/updated in this task window
+        # Isolate candidate files created/updated strictly in this task window
         task_candidates = [
             p for p in Path(data_dir).glob("search_contents_*.jsonl")
             if os.path.getmtime(p) >= start_time - 5.0
         ]
-        if task_candidates:
-            jsonl_files = sorted(task_candidates, key=os.path.getmtime, reverse=True)
-        else:
-            jsonl_files = sorted(Path(data_dir).glob("search_contents_*.jsonl"), key=os.path.getmtime, reverse=True)
+        if not task_candidates:
+            logger.info("No newly generated output files found in this crawl task window.")
+            return CrawlResponse(success=True, driver_name=self.name, total_notes=0, notes=[], references=[])
 
-        if not jsonl_files:
-            return CrawlResponse(success=True, driver_name=self.name, total_notes=0, notes=[])
-
+        jsonl_files = sorted(task_candidates, key=os.path.getmtime, reverse=True)
         latest_jsonl = str(jsonl_files[0])
         notes: List[UnifiedNote] = []
         references: List[NoteReference] = []
         target_keywords = set(request.keywords)
+        parse_errors_count = 0
 
         with open(latest_jsonl, "r", encoding="utf-8") as f:
             for line in f:
@@ -228,8 +229,18 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                     if target_keywords and kw not in target_keywords:
                         continue
 
-                    tags = [t.strip() for t in raw.get("tag_list", "").split(",") if t.strip()]
-                    images = [img.strip() for img in raw.get("image_list", "").split(",") if img.strip()]
+                    tags = [t.strip() for t in raw.get("tag_list", "").split(",") if t.strip()] if isinstance(raw.get("tag_list"), str) else []
+                    images_raw = raw.get("image_list")
+                    video_raw = raw.get("video_url")
+                    images = [sanitize_note_url(img.strip()) for img in images_raw.split(",") if img.strip()] if isinstance(images_raw, str) else []
+                    video_url = sanitize_note_url(str(video_raw)) if video_raw else ""
+
+                    if ("image_list" not in raw and "video_url" not in raw) or (images_raw is None and not video_url):
+                        media_pres = FieldPresence.NOT_FETCHED
+                    elif not images and not video_url:
+                        media_pres = FieldPresence.KNOWN_EMPTY
+                    else:
+                        media_pres = FieldPresence.VALID
 
                     metrics = EngagementMetrics.from_raw(
                         likes=raw.get("liked_count"),
@@ -239,8 +250,20 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                     )
 
                     note_type = str(raw.get("type", "normal"))
-                    desc_text = str(raw.get("desc", ""))
-                    completeness = self._determine_completeness(note_type, desc_text)
+                    raw_desc = raw.get("desc")
+                    if "desc" not in raw or raw_desc is None:
+                        desc_text = ""
+                        desc_pres = FieldPresence.NOT_FETCHED
+                        completeness = ContentCompleteness.EMPTY
+                    elif not str(raw_desc).strip():
+                        desc_text = ""
+                        desc_pres = FieldPresence.KNOWN_EMPTY
+                        completeness = ContentCompleteness.EMPTY
+                    else:
+                        desc_text = str(raw_desc)
+                        desc_pres = FieldPresence.VALID
+                        completeness = self._determine_completeness(note_type, desc_text)
+
                     clean_url = sanitize_note_url(str(raw.get("note_url", "")))
                     note_id = str(raw.get("note_id", ""))
 
@@ -249,7 +272,8 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                         title=str(raw.get("title", "")),
                         desc=desc_text,
                         completeness=completeness,
-                        desc_presence=FieldPresence.VALID if desc_text else FieldPresence.KNOWN_EMPTY,
+                        desc_presence=desc_pres,
+                        media_presence=media_pres,
                         note_type=note_type,
                         author_id=str(raw.get("creator_hash", "")),
                         author_name=str(raw.get("nickname", "匿名用户")),
@@ -257,7 +281,7 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                         url=clean_url or f"https://www.xiaohongshu.com/explore/{note_id}",
                         tag_list=tags,
                         image_list=images,
-                        video_url=str(raw.get("video_url", "")),
+                        video_url=video_url,
                         published_at=raw.get("time")
                     )
                     note.add_discovery(keyword=kw)
@@ -275,14 +299,17 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                     )
                     references.append(ref)
                 except Exception:
+                    parse_errors_count += 1
                     continue
 
+        parse_warnings = [f"Encountered {parse_errors_count} malformed records"] if parse_errors_count > 0 else []
         return CrawlResponse(
             success=True,
             driver_name=self.name,
             total_notes=len(notes),
             notes=notes,
             references=references,
+            errors=parse_warnings,
             output_files={"jsonl": latest_jsonl}
         )
 

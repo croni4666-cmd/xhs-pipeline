@@ -98,11 +98,11 @@ class HttpCrawlerDriver(BaseCrawlerDriver):
         
         has_desc = ("desc" in item) or ("content" in item)
         raw_desc = item.get("desc") if "desc" in item else item.get("content")
-        if not has_desc:
+        if not has_desc or raw_desc is None:
             desc = ""
             comp = ContentCompleteness.EMPTY
             desc_pres = FieldPresence.NOT_FETCHED
-        elif raw_desc is None or not str(raw_desc).strip():
+        elif not str(raw_desc).strip():
             desc = ""
             comp = ContentCompleteness.EMPTY
             desc_pres = FieldPresence.KNOWN_EMPTY
@@ -126,16 +126,22 @@ class HttpCrawlerDriver(BaseCrawlerDriver):
             shares=_get_metric_val("share_count", "shares")
         )
 
-        has_media = ("images" in item) or ("image_list" in item)
+        has_media = ("images" in item) or ("image_list" in item) or ("video_url" in item)
         images = item.get("images") if "images" in item else item.get("image_list")
+        clean_images = []
         if images is None:
-            images = []
+            clean_images = []
         elif isinstance(images, str):
-            images = [img.strip() for img in images.split(",") if img.strip()]
+            clean_images = [sanitize_note_url(img.strip()) for img in images.split(",") if img.strip()]
+        elif isinstance(images, list):
+            clean_images = [sanitize_note_url(str(img).strip()) for img in images if str(img).strip()]
 
-        if not has_media:
+        raw_video_url = str(item.get("video_url") or "")
+        clean_video_url = sanitize_note_url(raw_video_url) if raw_video_url else ""
+
+        if not has_media or (images is None and not raw_video_url):
             media_pres = FieldPresence.NOT_FETCHED
-        elif not images:
+        elif not clean_images and not clean_video_url:
             media_pres = FieldPresence.KNOWN_EMPTY
         else:
             media_pres = FieldPresence.VALID
@@ -160,12 +166,14 @@ class HttpCrawlerDriver(BaseCrawlerDriver):
             metrics=metrics,
             url=clean_url,
             tag_list=tags,
-            image_list=images,
-            video_url=str(item.get("video_url") or ""),
-            published_at=item.get("time") or item.get("published_at")
+            image_list=clean_images,
+            video_url=clean_video_url,
+            published_at=item.get("time") or item.get("published_at"),
+            is_synthetic=True,
+            data_source="synthetic_simulation"
         )
         if keyword:
-            note.add_discovery(keyword=keyword)
+            note.add_discovery(keyword=keyword, source_type="synthetic_http")
         return note
 
     async def crawl_keywords(self, request: CrawlRequest) -> CrawlResponse:
@@ -194,6 +202,8 @@ class HttpCrawlerDriver(BaseCrawlerDriver):
                 ]
                 for idx, item in enumerate(synthetic_items, 1):
                     n = self._parse_raw_note(item, keyword=kw)
+                    # Explicitly attach rank to discovery record
+                    n.add_discovery(keyword=kw, rank=idx, source_type="synthetic_http")
                     notes.append(n)
                     ref = NoteReference(
                         note_id=n.note_id,
@@ -217,7 +227,9 @@ class HttpCrawlerDriver(BaseCrawlerDriver):
             notes=notes,
             references=references,
             errors=errors,
-            is_partial=is_partial
+            is_partial=is_partial,
+            is_synthetic=True,
+            data_source="synthetic_simulation"
         )
 
     async def get_note_detail(self, target: Union[str, NoteReference]) -> Optional[UnifiedNote]:
@@ -234,6 +246,8 @@ class HttpCrawlerDriver(BaseCrawlerDriver):
             "liked_count": "1.2万",
             "nickname": "HTTP作者"
         })
+        note.is_synthetic = True
+        note.data_source = "synthetic_simulation"
         if isinstance(target, NoteReference) and target.discovered_keyword:
             note.add_discovery(keyword=target.discovered_keyword, rank=target.rank, source_type="reference")
         return note

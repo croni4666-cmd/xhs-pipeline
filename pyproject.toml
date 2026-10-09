@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xhs-pipeline"
-version = "0.3.1rc2"
+version = "0.3.2rc3"
 description = "Industrial-grade Xiaohongshu research, multi-driver crawling, reproducibility manifests, and Obsidian PKM pipeline."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -55,14 +55,46 @@ class ObsidianExporter:
         return raw_val if raw_val else "0"
 
     def _find_existing_file(self, note_id: str) -> Optional[str]:
-        """Finds existing file for note_id with exact prefix matching to prevent prefix collision."""
+        """Finds existing file for note_id with exact frontmatter or exact name matching."""
         if not os.path.exists(self.vault_dir):
             return None
-        safe_id = re.escape(note_id)
-        pattern = re.compile(rf"^XHS_{safe_id}(_.*)?\.md$")
-        for p in Path(self.vault_dir).iterdir():
-            if p.is_file() and pattern.match(p.name):
+
+        exact_path = os.path.join(self.vault_dir, f"XHS_{note_id}.md")
+        if os.path.isfile(exact_path):
+            return exact_path
+
+        target_token = f'note_id: "{note_id}"'
+        prefix = f"XHS_{note_id}_"
+        candidates = []
+        for p in Path(self.vault_dir).glob("XHS_*.md"):
+            if not p.is_file():
+                continue
+            if p.name == f"XHS_{note_id}.md":
                 return str(p)
+            if p.name.startswith(prefix) or p.name.startswith(f"XHS_{note_id}."):
+                candidates.append(p)
+
+        # 1. Match by frontmatter note_id
+        for p in candidates:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    head = f.read(1024)
+                if target_token in head:
+                    return str(p)
+            except Exception:
+                continue
+
+        # 2. Match legacy files without YAML frontmatter
+        for p in candidates:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    head = f.read(1024)
+                if "note_id: " in head and target_token not in head:
+                    continue
+                return str(p)
+            except Exception:
+                continue
+
         return None
 
     def export_note(self, note: UnifiedNote) -> Tuple[str, str]:
@@ -87,9 +119,53 @@ class ObsidianExporter:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     old_content = f.read()
-                    if self.USER_NOTES_HEADER in old_content:
-                        # Extract from the LAST occurrence to avoid false matches in source description
-                        preserved_user_notes = old_content.rsplit(self.USER_NOTES_HEADER, 1)[1]
+
+                begin_tag = "<!-- BEGIN_USER_NOTES -->"
+                end_tag = "<!-- END_USER_NOTES -->"
+
+                if begin_tag in old_content:
+                    start_pos = old_content.find(begin_tag) + len(begin_tag)
+                    if end_tag in old_content[start_pos:]:
+                        end_offset = old_content[start_pos:].find(end_tag)
+                        inside_notes = old_content[start_pos:start_pos + end_offset]
+                        after_notes = old_content[start_pos + end_offset + len(end_tag):]
+                        preserved_user_notes = inside_notes.strip()
+                        if after_notes.strip():
+                            preserved_user_notes = (preserved_user_notes + "\n\n" + after_notes.strip()).strip()
+                    else:
+                        preserved_user_notes = old_content[start_pos:].strip()
+
+                elif self.USER_NOTES_HEADER in old_content:
+                    # In our layout, the designated header is after "### 🏷️ 关联标签"
+                    tag_pos = old_content.rfind("### 🏷️ 关联标签")
+                    if tag_pos != -1:
+                        sub = old_content[tag_pos:]
+                        header_offset = sub.find(self.USER_NOTES_HEADER)
+                        if header_offset != -1:
+                            preserved_user_notes = sub[header_offset + len(self.USER_NOTES_HEADER):].strip()
+                        else:
+                            preserved_user_notes = old_content.split(self.USER_NOTES_HEADER)[-1].strip()
+                    else:
+                        fm_end = old_content.find("\n---\n", 3)
+                        search_start = fm_end + 5 if fm_end != -1 else 0
+                        header_pos = old_content.find(self.USER_NOTES_HEADER, search_start)
+                        if header_pos != -1:
+                            preserved_user_notes = old_content[header_pos + len(self.USER_NOTES_HEADER):].strip()
+                        else:
+                            preserved_user_notes = old_content.rsplit(self.USER_NOTES_HEADER, 1)[1].strip()
+
+                else:
+                    # Legacy or user file without designated header
+                    if old_content.strip():
+                        preserved_user_notes = old_content.strip()
+
+                # Clean untouched default placeholder
+                default_hint = "在此记录您针对该笔记的研究心得、拆解要点或仿写灵感（重新导出时将受到永久保护，不会被覆盖）。"
+                if preserved_user_notes and default_hint in preserved_user_notes:
+                    cleaned = preserved_user_notes.replace(default_hint, "").replace(">", "").strip()
+                    if not cleaned:
+                        preserved_user_notes = ""
+
             except OSError as e:
                 # If existing file cannot be read, never silently overwrite human annotations!
                 logger.error(f"Cannot read existing card {file_path} to preserve annotations: {e}")
@@ -120,6 +196,7 @@ class ObsidianExporter:
         comments_display = self._format_metric_display(note.metrics.raw_comments, note.metrics.comments_presence)
 
         # 5. Build Markdown card with LF line endings
+        notes_section = preserved_user_notes if preserved_user_notes else '> 在此记录您针对该笔记的研究心得、拆解要点或仿写灵感（重新导出时将受到永久保护，不会被覆盖）。'
         md_content = f"""---
 note_id: "{note.note_id}"
 title: "{note.title.replace('"', "'")}"
@@ -164,7 +241,9 @@ tags:
 ---
 
 {self.USER_NOTES_HEADER}
-{preserved_user_notes if preserved_user_notes else '\n> 在此记录您针对该笔记的研究心得、拆解要点或仿写灵感（重新导出时将受到永久保护，不会被覆盖）。\n'}
+<!-- BEGIN_USER_NOTES -->
+{notes_section}
+<!-- END_USER_NOTES -->
 """
 
         # 6. Atomic Write: write exact bytes to unique .tmp file, then replace

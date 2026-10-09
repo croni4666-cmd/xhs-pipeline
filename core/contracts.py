@@ -358,6 +358,8 @@ class UnifiedNote:
     published_at: Optional[int] = None
     crawled_at: float = field(default_factory=time.time)
     stage_status: StageStatus = StageStatus.CRAWLED
+    is_synthetic: bool = False
+    data_source: str = "live"
 
     def __post_init__(self):
         if self.url:
@@ -394,6 +396,36 @@ class UnifiedNote:
     def content_hash(self) -> str:
         return self.fact.content_hash
 
+    def get_render_input_hash(self) -> str:
+        """Deterministic fingerprint of all attributes rendered into the Obsidian card."""
+        payload = json.dumps({
+            "v": "render_v1",
+            "content_hash": self.content_hash,
+            "title": self.title,
+            "desc": self.desc,
+            "author_name": self.author_name,
+            "completeness": self.completeness.value,
+            "desc_presence": self.desc_presence.value,
+            "media_presence": self.media_presence.value,
+            "likes": self.metrics.likes,
+            "raw_likes": self.metrics.raw_likes,
+            "likes_presence": self.metrics.likes_presence.value,
+            "collects": self.metrics.collects,
+            "raw_collects": self.metrics.raw_collects,
+            "collects_presence": self.metrics.collects_presence.value,
+            "comments": self.metrics.comments,
+            "raw_comments": self.metrics.raw_comments,
+            "comments_presence": self.metrics.comments_presence.value,
+            "shares": self.metrics.shares,
+            "raw_shares": self.metrics.raw_shares,
+            "shares_presence": self.metrics.shares_presence.value,
+            "keywords": sorted([d.keyword for d in self.discovery_records if d.keyword]),
+            "tags": sorted(self.tag_list),
+            "insights": [ins.insight_id for ins in self.insights],
+            "url": self.url
+        }, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
     def add_discovery(
         self,
         keyword: Optional[str] = None,
@@ -405,9 +437,11 @@ class UnifiedNote:
         ts = discovered_at if discovered_at is not None else time.time()
         for rec in self.discovery_records:
             if rec.keyword == keyword and rec.source_type == source_type:
-                if rank is not None and rec.rank is None:
+                if rec.rank == rank:
+                    return
+                elif rank is not None and rec.rank is None:
                     rec.rank = rank
-                return
+                    return
         self.discovery_records.append(DiscoveryRecord(
             source_type=source_type,
             keyword=keyword,
@@ -467,7 +501,9 @@ class UnifiedNote:
             "crawled_at": self.crawled_at,
             "stage_status": self.stage_status.value,
             "content_hash": self.content_hash,
-            "insight_count": len(self.insights)
+            "insight_count": len(self.insights),
+            "is_synthetic": self.is_synthetic,
+            "data_source": self.data_source
         }
 
 
@@ -552,3 +588,5 @@ class CrawlResponse:
     output_files: Dict[str, str] = field(default_factory=dict)
     is_partial: bool = False
     manifest: Optional[CrawlTaskManifest] = None
+    is_synthetic: bool = False
+    data_source: str = "live"
