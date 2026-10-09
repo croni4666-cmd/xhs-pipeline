@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python environment & packaging
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# Credentials, cookies, sessions & tokens (Anti-Leak)
+.env
+.env.*
+*.cookie
+*.cookies
+*.session
+*.token
+tokens/
+cookies/
+browser_data/
+*.key
+*.pem
+
+# Data artifacts & Scraped datasets
+data/
+*.jsonl
+*.csv
+obsidian_cards/
+obsidian_export/
+*.tmp
+*.log
+qrcode_login.*
+*.png
+*.jpg
+
+# Local configurations with private paths (keep settings.example.json)
+config/settings.local.json
+config/settings.json
+!config/settings.example.json

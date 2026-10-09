@@ -1,0 +1,15 @@
+{
+  "active_driver": "mediacrawler",
+  "fallback_driver": "mock",
+  "mediacrawler_path": "./MediaCrawler",
+  "python_path": "python",
+  "cdp_port": 9222,
+  "default_limit": 20,
+  "enable_comments": false,
+  "enable_media": false,
+  "max_request_budget": 100,
+  "rate_limit_per_minute": 30,
+  "output_dir": "./data/xhs",
+  "obsidian_vault_dir": "./obsidian_cards",
+  "checkpoint_dir": "./data/checkpoints"
+}
