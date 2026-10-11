@@ -15,12 +15,15 @@ import sys
 import json
 import time
 import ast
+import hashlib
 import asyncio
 import re
 import logging
 import urllib.request
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
+from ..security import redact_error
+from ..persistence import atomic_write_bytes
 
 from .base import BaseCrawlerDriver
 from ..contracts import (
@@ -78,13 +81,10 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         if not os.path.isdir(self.mediacrawler_path):
             raise DriverError(f"MediaCrawler directory does not exist: {self.mediacrawler_path}")
 
-    async def close(self) -> None:
-        """Kills any lingering crawler subprocess upon teardown."""
-        if self._current_subprocess and self._current_subprocess.returncode is None:
-            try:
-                self._current_subprocess.terminate()
-            except Exception:
-                pass
+    async def close(self):
+        if self._current_subprocess is not None:
+            await self._terminate(self._current_subprocess)
+            self._current_subprocess = None
 
     async def health_check(self) -> bool:
         if not os.path.isdir(self.mediacrawler_path):
@@ -99,14 +99,7 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
             return False
 
     def _sanitize_error_msg(self, msg: str) -> str:
-        # Redact xsec_token in key=value, key: value, or JSON "key": "value" (case-insensitive)
-        msg = re.sub(r'(?i)(["\']?xsec_token["\']?\s*[:=]\s*["\']?)[a-zA-Z0-9_\-]+(["\']?)', r'\g<1>[REDACTED]\g<2>', msg)
-        msg = re.sub(r'(?i)(Bearer\s+)[a-zA-Z0-9_\.\-]+', r'\1[REDACTED]', msg)
-        # Redact cookies in cookie: value, cookie=value, or JSON "cookie": "value" (case-insensitive)
-        msg = re.sub(r'(?i)(["\']?cookie["\']?\s*[:=]\s*["\']?)[^\r\n"\'\},]+(["\']?)', r'\g<1>[REDACTED]\g<2>', msg)
-        msg = re.sub(r'[A-Za-z]:\\[^ \t\r\n"\']+', '[REDACTED_PATH]', msg)
-        msg = re.sub(r'/(?:home|Users)/[^ \t\r\n"\']+', '[REDACTED_PATH]', msg)
-        return msg
+        return redact_error(msg)
 
     def _configure_mediacrawler(self, request: CrawlRequest) -> None:
         config_file = os.path.join(self.mediacrawler_path, "config", "base_config.py")
@@ -116,31 +109,74 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         with open(config_file, "r", encoding="utf-8") as f:
             content = f.read()
 
-        safe_kw_literal = json.dumps(",".join(request.keywords), ensure_ascii=False)
-        safe_count = int(request.max_count_per_keyword)
-        safe_comments = bool(request.enable_comments)
+        sort_type = {"latest": "time_descending"}.get(request.sort_type, request.sort_type)
+        if sort_type not in ("general", "popularity_descending", "time_descending"):
+            from ..contracts import CapabilityUnsupportedError
+            raise CapabilityUnsupportedError("Unsupported Xiaohongshu sort mode")
+        values = {"KEYWORDS": ",".join(request.keywords),
+                  "CRAWLER_MAX_NOTES_COUNT": int(request.max_count_per_keyword),
+                  "ENABLE_GET_COMMENTS": bool(request.enable_comments),
+                  "ENABLE_GET_MEDIA": bool(request.enable_media), "CDP_DEBUG_PORT": int(self.cdp_port),
+                  "ENABLE_CDP_MODE": True, "CDP_CONNECT_EXISTING": True,
+                  "AUTO_CLOSE_BROWSER": False, "SORT_TYPE": sort_type,
+                  "PLATFORM": "xhs", "CRAWLER_TYPE": "search", "SAVE_DATA_OPTION": "jsonl"}
+        source = self._rewrite_assignments(content, values)
+        platform_file = os.path.join(self.mediacrawler_path, "config", "xhs_config.py")
+        platform_source = None
+        if os.path.exists(platform_file):
+            with open(platform_file, encoding="utf-8") as stream:
+                platform_source = self._rewrite_assignments(stream.read(), {"SORT_TYPE": sort_type})
+        if platform_source is not None:
+            atomic_write_bytes(platform_file, platform_source)
+        atomic_write_bytes(config_file, source)
+        self.effective_config = {**values, "config_sha256": hashlib.sha256(source).hexdigest()}
 
-        # Full-line multiline replacement prevents any escaped-quote statement injection
-        content = re.sub(r'(?m)^[ \t]*KEYWORDS\s*=.*$', lambda _: f'KEYWORDS = {safe_kw_literal}', content)
-        content = re.sub(r'(?m)^[ \t]*CRAWLER_MAX_NOTES_COUNT\s*=.*$', lambda _: f'CRAWLER_MAX_NOTES_COUNT = {safe_count}', content)
-        content = re.sub(r'(?m)^[ \t]*ENABLE_GET_COMMENTS\s*=.*$', lambda _: f'ENABLE_GET_COMMENTS = {safe_comments}', content)
-        content = re.sub(r'(?m)^[ \t]*ENABLE_CDP_MODE\s*=.*$', lambda _: 'ENABLE_CDP_MODE = True', content)
-        content = re.sub(r'(?m)^[ \t]*CDP_CONNECT_EXISTING\s*=.*$', lambda _: 'CDP_CONNECT_EXISTING = True', content)
-        content = re.sub(r'(?m)^[ \t]*AUTO_CLOSE_BROWSER\s*=.*$', lambda _: 'AUTO_CLOSE_BROWSER = False', content)
+    @staticmethod
+    def _rewrite_assignments(content, values):
 
-        # Syntax AST validation to ensure no code injection
         try:
-            ast.parse(content)
-        except Exception as e:
-            raise DriverError(f"Generated MediaCrawler configuration is invalid: {e}")
-
-        # Atomic configuration write
-        temp_file = f"{config_file}.{os.getpid()}_{time.time_ns()}.tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_file, config_file)
+            tree = ast.parse(content)
+            source = content.encode("utf-8")
+            offsets = [0]
+            for line in source.splitlines(keepends=True):
+                offsets.append(offsets[-1] + len(line))
+            replacements, seen, allowed_targets = [], set(), []
+            for node in tree.body:
+                targets = (node.targets if isinstance(node, ast.Assign)
+                           else [node.target] if isinstance(node, ast.AnnAssign) else [])
+                for target in targets:
+                    if not isinstance(target, ast.Name) or target.id not in values:
+                        continue
+                    if target.id in seen or len(targets) != 1 or node.value is None:
+                        raise ValueError("Ambiguous crawler configuration assignment")
+                    seen.add(target.id)
+                    allowed_targets.append(target)
+                    value = values[target.id]
+                    literal = json.dumps(value, ensure_ascii=False) if isinstance(value, str) else repr(value)
+                    start = offsets[node.value.lineno - 1] + node.value.col_offset
+                    end = offsets[node.value.end_lineno - 1] + node.value.end_col_offset
+                    replacements.append((start, end, literal.encode("utf-8")))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in values:
+                    if node not in allowed_targets:
+                        raise ValueError("Conditional crawler configuration is unsupported")
+            for start, end, literal in sorted(replacements, reverse=True):
+                source = source[:start] + literal + source[end:]
+            for name in sorted(values.keys() - seen):
+                value = values[name]
+                literal = json.dumps(value, ensure_ascii=False) if isinstance(value, str) else repr(value)
+                source += f"\n{name} = {literal}\n".encode("utf-8")
+            updated = ast.parse(source)
+            for node in updated.body:
+                targets = (node.targets if isinstance(node, ast.Assign)
+                           else [node.target] if isinstance(node, ast.AnnAssign) else [])
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id in values:
+                        if ast.literal_eval(node.value) != values[target.id]:
+                            raise ValueError("Crawler configuration verification failed")
+        except (SyntaxError, ValueError, TypeError) as exc:
+            raise DriverError(redact_error(f"Invalid crawler configuration: {exc}")) from exc
+        return source
 
     def _determine_completeness(self, note_type: str, desc: str) -> ContentCompleteness:
         if not desc or len(desc.strip()) == 0:
@@ -149,169 +185,100 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
             return ContentCompleteness.VIDEO_ONLY
         return ContentCompleteness.FULL
 
-    async def crawl_keywords(self, request: CrawlRequest) -> CrawlResponse:
-        """Executes crawl with strict cancellation cleanup and NoteReference extraction."""
-        if not await self.health_check():
-            return CrawlResponse(
-                success=False,
-                driver_name=self.name,
-                total_notes=0,
-                notes=[],
-                errors=["CDP port 9222 is unreachable. Ensure Edge/Chrome is launched via start_edge_debug.bat."]
-            )
-
-        start_time = time.time()
-        self._configure_mediacrawler(request)
-
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-
-        proc = await asyncio.create_subprocess_exec(
-            self.python_path, "main.py",
-            cwd=self.mediacrawler_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        self._current_subprocess = proc
-
+    @property
+    def version(self):
+        import subprocess
         try:
-            stdout, stderr = await proc.communicate()
-        except asyncio.CancelledError:
-            # Cancellation Semantics: Cleanly terminate child process and propagate CancelledError
-            logger.warning("Crawl task cancelled by caller. Terminating MediaCrawler subprocess...")
+            result = subprocess.run(["git", "-C", self.mediacrawler_path, "rev-parse", "HEAD"],
+                                    capture_output=True, text=True, timeout=2, check=False)
+            revision = result.stdout.strip()
+            return revision if re.fullmatch(r"[0-9a-f]{40}", revision) else "unknown"
+        except (OSError, subprocess.TimeoutExpired):
+            return "unknown"
+
+    async def _terminate(self, process):
+        if process.returncode is not None:
+            await process.wait()
+            return
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3)
+        except asyncio.TimeoutError:
             try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
-            except (asyncio.TimeoutError, Exception):
-                proc.kill()
-            raise
-        finally:
-            self._current_subprocess = None
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
 
-        if proc.returncode != 0:
-            err_msg = self._sanitize_error_msg(stderr.decode("utf-8", errors="replace"))
-            return CrawlResponse(
-                success=False,
-                driver_name=self.name,
-                total_notes=0,
-                notes=[],
-                errors=[f"MediaCrawler exited with code {proc.returncode}: {err_msg[:300]}"]
-            )
-
-        data_dir = os.path.join(self.mediacrawler_path, "data", "xhs", "jsonl")
-        if not os.path.exists(data_dir):
-            return CrawlResponse(success=True, driver_name=self.name, total_notes=0, notes=[])
-
-        # Isolate candidate files created/updated strictly in this task window
-        task_candidates = [
-            p for p in Path(data_dir).glob("search_contents_*.jsonl")
-            if os.path.getmtime(p) >= start_time - 5.0
-        ]
-        if not task_candidates:
-            logger.info("No newly generated output files found in this crawl task window.")
-            return CrawlResponse(success=True, driver_name=self.name, total_notes=0, notes=[], references=[])
-
-        jsonl_files = sorted(task_candidates, key=os.path.getmtime, reverse=True)
-        latest_jsonl = str(jsonl_files[0])
-        notes: List[UnifiedNote] = []
-        references: List[NoteReference] = []
-        target_keywords = set(request.keywords)
-        parse_errors_count = 0
-
-        with open(latest_jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
+    async def crawl_keywords(self, request):
+        from ..persistence import async_file_lock
+        from ..normalizer import normalize_raw_note
+        if not await self.health_check():
+            return CrawlResponse(False, self.name, 0, [], errors=["Local CDP endpoint is unavailable"])
+        async with async_file_lock(Path(self.mediacrawler_path) / ".xhs-pipeline.lock"):
+            self._configure_mediacrawler(request)
+            data_dir = Path(self.cfg.get("mediacrawler_output_dir", str(Path(self.mediacrawler_path) / "data" / "xhs" / "jsonl")))
+            before = {}
+            for file in data_dir.glob("search_contents_*.jsonl"):
+                if file.is_file() and not file.is_symlink():
+                    data = file.read_bytes()
+                    before[str(file)] = (len(data), hashlib.sha256(data).hexdigest())
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            process = await asyncio.create_subprocess_exec(
+                self.python_path, "main.py", cwd=self.mediacrawler_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+            self._current_subprocess = process
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=float(self.cfg.get("crawl_timeout_seconds", 300)))
+            except asyncio.CancelledError:
+                await self._terminate(process)
+                raise
+            except asyncio.TimeoutError as exc:
+                await self._terminate(process)
+                raise DriverError("Crawler operation timed out") from exc
+            finally:
+                self._current_subprocess = None
+            if process.returncode != 0:
+                error = self._sanitize_error_msg(stderr.decode("utf-8", errors="replace"))
+                return CrawlResponse(False, self.name, 0, [], errors=[f"Crawler failed: {error[:300]}"])
+            notes, references, errors, output_files = [], [], [], {}
+            for file in sorted(data_dir.glob("search_contents_*.jsonl")):
+                if not file.is_file() or file.is_symlink():
                     continue
-                try:
-                    raw = json.loads(line)
-                    kw = str(raw.get("source_keyword", ""))
-                    if target_keywords and kw not in target_keywords:
+                data = file.read_bytes()
+                snapshot = before.get(str(file))
+                if snapshot and hashlib.sha256(data).hexdigest() == snapshot[1]:
+                    continue
+                if snapshot and len(data) >= snapshot[0] and hashlib.sha256(data[:snapshot[0]]).hexdigest() == snapshot[1]:
+                    data = data[snapshot[0]:]
+                if not data.strip():
+                    continue
+                output_files["jsonl" if not output_files else f"jsonl_{len(output_files)}"] = str(file)
+                for index, line in enumerate(data.decode("utf-8").splitlines(), 1):
+                    if not line.strip():
                         continue
-
-                    tags = [t.strip() for t in raw.get("tag_list", "").split(",") if t.strip()] if isinstance(raw.get("tag_list"), str) else []
-                    images_raw = raw.get("image_list")
-                    video_raw = raw.get("video_url")
-                    images = [sanitize_note_url(img.strip()) for img in images_raw.split(",") if img.strip()] if isinstance(images_raw, str) else []
-                    video_url = sanitize_note_url(str(video_raw)) if video_raw else ""
-
-                    if ("image_list" not in raw and "video_url" not in raw) or (images_raw is None and not video_url):
-                        media_pres = FieldPresence.NOT_FETCHED
-                    elif not images and not video_url:
-                        media_pres = FieldPresence.KNOWN_EMPTY
-                    else:
-                        media_pres = FieldPresence.VALID
-
-                    metrics = EngagementMetrics.from_raw(
-                        likes=raw.get("liked_count"),
-                        collects=raw.get("collected_count"),
-                        comments=raw.get("comment_count"),
-                        shares=raw.get("share_count")
-                    )
-
-                    note_type = str(raw.get("type", "normal"))
-                    raw_desc = raw.get("desc")
-                    if "desc" not in raw or raw_desc is None:
-                        desc_text = ""
-                        desc_pres = FieldPresence.NOT_FETCHED
-                        completeness = ContentCompleteness.EMPTY
-                    elif not str(raw_desc).strip():
-                        desc_text = ""
-                        desc_pres = FieldPresence.KNOWN_EMPTY
-                        completeness = ContentCompleteness.EMPTY
-                    else:
-                        desc_text = str(raw_desc)
-                        desc_pres = FieldPresence.VALID
-                        completeness = self._determine_completeness(note_type, desc_text)
-
-                    clean_url = sanitize_note_url(str(raw.get("note_url", "")))
-                    note_id = str(raw.get("note_id", ""))
-
-                    note = UnifiedNote(
-                        note_id=note_id,
-                        title=str(raw.get("title", "")),
-                        desc=desc_text,
-                        completeness=completeness,
-                        desc_presence=desc_pres,
-                        media_presence=media_pres,
-                        note_type=note_type,
-                        author_id=str(raw.get("creator_hash", "")),
-                        author_name=str(raw.get("nickname", "匿名用户")),
-                        metrics=metrics,
-                        url=clean_url or f"https://www.xiaohongshu.com/explore/{note_id}",
-                        tag_list=tags,
-                        image_list=images,
-                        video_url=video_url,
-                        published_at=raw.get("time")
-                    )
-                    note.add_discovery(keyword=kw)
-                    notes.append(note)
-
-                    # Encapsulate xsec_token in driver-level NoteReference
-                    ref = NoteReference(
-                        note_id=note_id,
-                        driver_name=self.name,
-                        title_hint=note.title,
-                        author_hint=note.author_name,
-                        access_token=str(raw.get("xsec_token", "")),
-                        discovered_keyword=kw,
-                        can_resume_cross_process=True
-                    )
-                    references.append(ref)
-                except Exception:
-                    parse_errors_count += 1
-                    continue
-
-        parse_warnings = [f"Encountered {parse_errors_count} malformed records"] if parse_errors_count > 0 else []
-        return CrawlResponse(
-            success=True,
-            driver_name=self.name,
-            total_notes=len(notes),
-            notes=notes,
-            references=references,
-            errors=parse_warnings,
-            output_files={"jsonl": latest_jsonl}
-        )
+                    try:
+                        raw = json.loads(line)
+                        keyword = raw.get("source_keyword")
+                        if request.keywords and keyword not in request.keywords:
+                            continue
+                        note = normalize_raw_note(raw, keyword=keyword, rank=raw.get("rank"), data_source="mediacrawler")
+                        notes.append(note)
+                        references.append(NoteReference(
+                            note_id=note.note_id, driver_name=self.name, title_hint=note.title,
+                            author_hint=note.author_name, access_token=str(raw.get("xsec_token") or ""),
+                            discovered_keyword=keyword or "", rank=raw.get("rank"), can_resume_cross_process=False))
+                    except (ValueError, TypeError, AttributeError):
+                        errors.append(f"Malformed output record {index}")
+            return CrawlResponse(
+                success=bool(notes) or not errors, driver_name=self.name, total_notes=len(notes),
+                notes=notes, references=references, errors=errors, output_files=output_files,
+                is_partial=bool(errors), data_source="mediacrawler",
+                detail_success_count=None, detail_failed_count=None, actual_request_count=None)
 
     async def get_note_detail(self, target: Union[str, NoteReference]) -> Optional[UnifiedNote]:
         note_id = target.note_id if isinstance(target, NoteReference) else target
@@ -321,5 +288,5 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         if isinstance(target, NoteReference) and target.is_expired():
             raise ReferenceExpiredError(f"Access token for note {note_id} has expired.", note_id=note_id)
 
-        # Detail query in MediaCrawler
-        return None
+        from ..contracts import CapabilityUnsupportedError
+        raise CapabilityUnsupportedError("This adapter does not implement direct note detail queries")

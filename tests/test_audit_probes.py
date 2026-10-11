@@ -101,7 +101,7 @@ def test_f02_credential_and_url_boundary():
         assert "FAKE_RESUME_COOKIE" not in ref_file
 
         # Media URL token sanitization
-        http = HttpCrawlerDriver({})
+        http = HttpCrawlerDriver({"allow_synthetic": True})
         note = http._parse_raw_note({
             "note_id": "audit", "desc": "synthetic",
             "url": "https://example.invalid/n?xsec_token=FAKE_MAIN_TOKEN",
@@ -133,7 +133,7 @@ def test_f02_credential_and_url_boundary():
 
 def test_f03_synthetic_labeling_and_fallback():
     """F03: Synthetic source labeling and explicit fallback control."""
-    http = HttpCrawlerDriver({})
+    http = HttpCrawlerDriver({"allow_synthetic": True})
     note = http._parse_raw_note({"note_id": "sim_note", "desc": "Simulated"})
     assert note.is_synthetic is True
     assert note.data_source == "synthetic_simulation"

@@ -14,6 +14,7 @@ Guarantees Taleb-style anti-ruin defense:
 import time
 import asyncio
 import random
+import threading
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Callable, Awaitable
@@ -41,36 +42,32 @@ class RequestBudgetManager:
         self.max_budget = max_budget
         self.rate_limit_per_min = rate_limit_per_min
         self.used_requests = 0
+        self._guard = threading.Lock()
         self.timestamps: List[float] = []
 
     def can_request(self) -> bool:
         return self.used_requests < self.max_budget
 
     async def acquire(self):
-        """
-        Acquires permission to execute a request.
-        Raises BudgetExceededError if cumulative budget is exhausted.
-        Throttles if per-minute rate limit is reached.
-        """
-        if self.used_requests >= self.max_budget:
-            raise BudgetExceededError(
-                f"Request budget exhausted: {self.used_requests}/{self.max_budget} requests used."
-            )
-
-        now = time.time()
-        # Clean timestamps older than 60 seconds
-        self.timestamps = [t for t in self.timestamps if now - t < 60.0]
-
-        if len(self.timestamps) >= self.rate_limit_per_min:
-            oldest = self.timestamps[0]
-            sleep_needed = max(0.1, 60.0 - (now - oldest) + random.uniform(0.1, 0.5))
-            await asyncio.sleep(sleep_needed)
-
-        self.used_requests += 1
-        self.timestamps.append(time.time())
+        """Consume one driver attempt; waiting tasks recheck quota after every wait."""
+        if self.max_budget < 0 or self.rate_limit_per_min < 1:
+            raise ValueError("Budget must be nonnegative and rate limit positive")
+        while True:
+            with self._guard:
+                if self.used_requests >= self.max_budget:
+                    raise BudgetExceededError(f"Driver attempt budget exhausted: {self.used_requests}/{self.max_budget}")
+                now = time.time()
+                self.timestamps = [stamp for stamp in self.timestamps if now - stamp < 60]
+                if len(self.timestamps) < self.rate_limit_per_min:
+                    self.used_requests += 1
+                    self.timestamps.append(now)
+                    return
+                delay = max(0.1, 60 - (now - self.timestamps[0]) + random.uniform(0.1, 0.5))
+            await asyncio.sleep(delay)
 
     def get_stats(self) -> Dict[str, Any]:
         return {
+            "budget_unit": "driver_attempt",
             "max_budget": self.max_budget,
             "used_requests": self.used_requests,
             "remaining_budget": max(0, self.max_budget - self.used_requests),
@@ -104,6 +101,8 @@ class ExponentialBackoff:
         delay = self.initial_delay
         last_exception = None
 
+        if self.max_retries < 1:
+            raise ValueError("retry attempts must be positive")
         for attempt in range(1, self.max_retries + 1):
             try:
                 return await fn(*args, **kwargs)

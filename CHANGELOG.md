@@ -3,6 +3,14 @@
 本项目遵循 [语义化版本 2.0.0 (Semantic Versioning)](https://semver.org/lang/zh-CN/) 规范。  
 变更日志格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [Unreleased]
+
+- 修复 RC2/RC3 复审残留的配置注入、凭证隔离、字段状态、卡片对账、批注保留与并发提交问题，详见 `docs/audit-repairs.md`。
+- 明确模拟数据许可、驱动尝试预算、未知内部请求量与直接详情查询能力；失败和取消也保存任务清单。
+- 增加安装包资源、离线回归及安装后 CLI 验收，不宣称完成真实平台联调或 Stable 准入。
+
+以下条目保留历史版本说明；其中绝对性保证以当前 README、SECURITY 和修复记录中的边界为准。
+
 ## [0.3.2rc3] - 2026-10-09
 
 ### 🛡️ 审查闭环加固与完整性保证 (Comprehensive Audit Closure & Integrity Hardening)
