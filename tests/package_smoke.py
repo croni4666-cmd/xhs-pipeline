@@ -5,11 +5,12 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import sysconfig
 import tempfile
 
 
 def main():
-    entry = Path(sys.executable).parent / ('xhs-pipeline.exe' if os.name == 'nt' else 'xhs-pipeline')
+    entry = Path(sysconfig.get_path('scripts')) / ('xhs-pipeline.exe' if os.name == 'nt' else 'xhs-pipeline')
     env = dict(os.environ, PYTHONIOENCODING='utf-8')
     env.pop('PYTHONPATH', None)
     with tempfile.TemporaryDirectory(prefix='xhs-installed-') as temporary:
