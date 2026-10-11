@@ -1,5 +1,7 @@
 # 🗺️ xhs-pipeline 工程路线图 (Engineering Roadmap)
 
+> 本文保留历史规划。当前 HTTP 实现为模拟驱动，真实平台联调、内部 HTTP 请求预算及完整任务重放尚未完成；已落地行为与发布边界见 README、SECURITY.md 和 docs/audit-repairs.md。
+
 > **项目愿景**：打造工业级、开放式、严格区分“内容实体/采集上下文/任务状态”的小红书（Xiaohongshu）AI Agent 自动化研究与知识资产化管线。  
 > **核心原则**：契约上下文解耦（NoteReference）、学术研究可复现（CrawlTaskManifest）、崩溃一致性原子存储（Atomic Storage）、Taleb 式弹性自治防风控（Anti-Ruin Resilience）。
 

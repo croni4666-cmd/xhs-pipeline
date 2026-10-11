@@ -15,17 +15,16 @@ import time
 import re
 import json
 import hashlib
+import uuid
 from enum import Enum
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Optional, Tuple, Union
+from .security import sanitize_url
 
 
 def sanitize_note_url(raw_url: str) -> str:
     """Strips query parameters (?xsec_token=..., etc.) and fragments from note URLs."""
-    if not raw_url:
-        return ""
-    clean = raw_url.split("?")[0].split("#")[0].strip()
-    return clean
+    return sanitize_url(raw_url)
 
 
 # =====================================================================
@@ -98,6 +97,7 @@ class FieldPresence(str, Enum):
 
 class ContentCompleteness(str, Enum):
     """Explicit declaration of note text completeness."""
+    UNKNOWN = "unknown"      # No fetched body evidence; consult desc_presence.
     FULL = "full"            # Full text captured with no apparent truncation
     TRUNCATED = "truncated"  # Long text truncated by platform UI/API limit
     EMPTY = "empty"          # Note has zero description
@@ -140,8 +140,8 @@ class NoteReference:
     driver_name: str
     title_hint: str = ""
     author_hint: str = ""
-    access_token: str = ""                       # Driver-specific token (e.g. xsec_token)
-    access_context: Dict[str, Any] = field(default_factory=dict) # Cookies, URL signatures, headers
+    access_token: str = field(default="", repr=False)
+    access_context: Dict[str, Any] = field(default_factory=dict, repr=False)
     discovered_keyword: str = ""
     rank: Optional[int] = None
     created_at: float = field(default_factory=time.time)
@@ -277,7 +277,7 @@ class ContentFact:
     title: str
     desc: str
     note_type: str = "normal"                         # "normal" | "video"
-    author_id: str = ""                               # Stable anonymized identifier
+    author_id: str = ""                               # Platform identifier; not automatically anonymized
     author_name: str = ""                             # Display name
     completeness: ContentCompleteness = ContentCompleteness.FULL
     desc_presence: FieldPresence = FieldPresence.VALID
@@ -292,15 +292,13 @@ class ContentFact:
     def __post_init__(self):
         if self.source_url:
             self.source_url = sanitize_note_url(self.source_url)
+        self.image_list = [sanitize_url(url, media=True) for url in self.image_list]
+        self.video_url = sanitize_url(self.video_url, media=True)
         if not self.content_hash:
-            norm_payload = json.dumps({
-                "v": "fact_v1",
-                "title": self.title,
-                "desc": self.desc,
-                "author_id": self.author_id,
-                "note_type": self.note_type,
-                "tags": sorted(self.tag_list)
-            }, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            payload = asdict(self)
+            payload.pop("content_hash")
+            payload["schema"] = "fact_v2"
+            norm_payload = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
             self.content_hash = hashlib.sha256(norm_payload).hexdigest()
 
 
@@ -343,13 +341,13 @@ class UnifiedNote:
     title: str = ""
     desc: str = ""
     note_type: str = "normal"                         # "normal" | "video"
-    author_id: str = ""                               # Stable anonymized identifier
+    author_id: str = ""                               # Platform identifier; not automatically anonymized
     author_name: str = ""                             # Display name
     metrics: EngagementMetrics = field(default_factory=lambda: EngagementMetrics.from_raw())
     url: str = ""
-    completeness: ContentCompleteness = ContentCompleteness.FULL
-    desc_presence: FieldPresence = FieldPresence.VALID
-    media_presence: FieldPresence = FieldPresence.VALID
+    completeness: Optional[ContentCompleteness] = None
+    desc_presence: Optional[FieldPresence] = None
+    media_presence: Optional[FieldPresence] = None
     tag_list: List[str] = field(default_factory=list)
     image_list: List[str] = field(default_factory=list)
     video_url: str = ""
@@ -364,6 +362,12 @@ class UnifiedNote:
     def __post_init__(self):
         if self.url:
             self.url = sanitize_note_url(self.url)
+        if self.desc_presence is None:
+            self.desc_presence = FieldPresence.VALID if self.desc else FieldPresence.NOT_FETCHED
+        if self.completeness is None:
+            self.completeness = ContentCompleteness.FULL if self.desc else ContentCompleteness.UNKNOWN
+        if self.media_presence is None:
+            self.media_presence = FieldPresence.VALID if self.image_list or self.video_url else FieldPresence.NOT_FETCHED
 
     @property
     def primary_keyword(self) -> str:
@@ -386,8 +390,8 @@ class UnifiedNote:
             desc_presence=self.desc_presence,
             media_presence=self.media_presence,
             tag_list=list(self.tag_list),
-            image_list=list(self.image_list),
-            video_url=self.video_url,
+            image_list=[sanitize_url(url, media=True) for url in self.image_list],
+            video_url=sanitize_url(self.video_url, media=True),
             source_url=self.url,
             published_at=self.published_at
         )
@@ -399,7 +403,12 @@ class UnifiedNote:
     def get_render_input_hash(self) -> str:
         """Deterministic fingerprint of all attributes rendered into the Obsidian card."""
         payload = json.dumps({
-            "v": "render_v1",
+            "v": "render_v2",
+            "fact": asdict(self.fact),
+            "metrics": asdict(self.metrics),
+            "discoveries": [asdict(d) for d in self.discovery_records],
+            "is_synthetic": self.is_synthetic,
+            "data_source": self.data_source,
             "content_hash": self.content_hash,
             "title": self.title,
             "desc": self.desc,
@@ -421,8 +430,8 @@ class UnifiedNote:
             "shares_presence": self.metrics.shares_presence.value,
             "keywords": sorted([d.keyword for d in self.discovery_records if d.keyword]),
             "tags": sorted(self.tag_list),
-            "insights": [ins.insight_id for ins in self.insights],
-            "url": self.url
+            "insights": [asdict(ins) for ins in self.insights],
+            "url": sanitize_note_url(self.url)
         }, sort_keys=True, ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
@@ -436,12 +445,8 @@ class UnifiedNote:
         """Append a discovery pathway without overwriting previous associations."""
         ts = discovered_at if discovered_at is not None else time.time()
         for rec in self.discovery_records:
-            if rec.keyword == keyword and rec.source_type == source_type:
-                if rec.rank == rank:
-                    return
-                elif rank is not None and rec.rank is None:
-                    rec.rank = rank
-                    return
+            if (rec.keyword, rec.source_type, rec.rank, rec.discovered_at) == (keyword, source_type, rank, ts):
+                return
         self.discovery_records.append(DiscoveryRecord(
             source_type=source_type,
             keyword=keyword,
@@ -476,6 +481,7 @@ class UnifiedNote:
             "desc": self.desc,
             "completeness": self.completeness.value,
             "desc_presence": self.desc_presence.value,
+            "media_presence": self.media_presence.value,
             "note_type": self.note_type,
             "author_id": self.author_id,
             "author_name": self.author_name,
@@ -492,10 +498,10 @@ class UnifiedNote:
             "shares_raw": self.metrics.raw_shares,
             "shares_presence": self.metrics.shares_presence.value,
             "is_approximate_metric": self.metrics.is_approximate,
-            "url": self.url,
+            "url": sanitize_note_url(self.url),
             "tags": ",".join(self.tag_list),
-            "images": ",".join(self.image_list),
-            "video_url": self.video_url,
+            "images": ",".join(sanitize_url(url, media=True) for url in self.image_list),
+            "video_url": sanitize_url(self.video_url, media=True),
             "keywords": keywords_str,
             "published_at": self.published_at,
             "crawled_at": self.crawled_at,
@@ -529,12 +535,20 @@ class CrawlTaskManifest:
     request_quota: int = 20
     actual_discovered_count: int = 0
     deduplicated_count: int = 0
-    detail_success_count: int = 0
-    detail_failed_count: int = 0
+    detail_success_count: Optional[int] = 0
+    detail_failed_count: Optional[int] = 0
     stop_reason: str = "completed"              # "completed", "budget_exceeded", "cancelled", "rate_limited"
     filter_criteria: Dict[str, Any] = field(default_factory=dict)
     discovery_trails: List[Dict[str, Any]] = field(default_factory=list) # keyword -> rank -> note_id
     content_hashes: Dict[str, str] = field(default_factory=dict)         # note_id -> content_hash
+    effective_config: Dict[str, Any] = field(default_factory=dict)
+    config_fingerprint: str = ""
+    driver_attempts: List[Dict[str, Any]] = field(default_factory=list)
+    budget_stats: Dict[str, Any] = field(default_factory=dict)
+    actual_request_count: Optional[int] = None
+    data_source: str = "unknown"
+    is_synthetic: bool = False
+    errors: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -570,10 +584,11 @@ class CrawlRequest:
     enable_media: bool = False
     sort_type: str = "popularity_descending"
     task_id: str = ""
+    allow_synthetic: bool = False
 
     def __post_init__(self):
         if not self.task_id:
-            self.task_id = f"task_{int(time.time()*1000)}"
+            self.task_id = f"task_{uuid.uuid4().hex}"
 
 
 @dataclass
@@ -590,3 +605,6 @@ class CrawlResponse:
     manifest: Optional[CrawlTaskManifest] = None
     is_synthetic: bool = False
     data_source: str = "live"
+    detail_success_count: Optional[int] = 0
+    detail_failed_count: Optional[int] = 0
+    actual_request_count: Optional[int] = None

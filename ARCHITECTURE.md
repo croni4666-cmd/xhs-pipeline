@@ -1,5 +1,7 @@
 # 🏗️ xhs-pipeline 架构设计白皮书 (Architecture Specification v0.3.0)
 
+> 当前实现边界以 README、SECURITY.md 和 docs/audit-repairs.md 为准。HTTP 驱动仅为显式许可的模拟实现；预算计量驱动调用尝试；带凭证引用只保存元数据并在重启后重新搜索。卡片采用 fact_v2 / render_v2 / xhs_card_v2，校验完整生成区与磁盘字节，更新前保留备份。清单提供追溯，不能保证动态平台样本完全复现。
+
 ## 1. 架构目标与核心设计原则
 
 为彻底解决“笔记内容实体”、“抓取访问上下文”与“任务执行状态”长期耦合导致的测试困难与数据失真问题，本项目确立了以下现代软件架构规约：
@@ -55,7 +57,7 @@ flowchart TD
     end
 
     subgraph SinkLayer["5. 资产沉淀层 (Persistence Layer)"]
-        ObsidianVault["Obsidian 知识库 (00_Inbox/xhs_cards/)\n[原子写入, 永久保护用户笔记]"]
+        ObsidianVault["Obsidian 知识库\n[原子写入, 批注边界与冲突保护]"]
         ManifestLog["复现任务清单 (data/checkpoints/manifest_*.json)"]
         DataSummary["结构化数据导出 (CSV / JSON)"]
     end
@@ -171,4 +173,4 @@ class NoteReference:
 - `KNOWN_EMPTY`：确认平台该字段确为空。
 
 ### 5.4 研究复现任务清单 (`CrawlTaskManifest`)
-- 包含检索关键词、排序模式、配额上限、实际发现数、去重数、详情成功率及内容版本哈希字典，供学术论文与实证研究 100% 溯源复现。
+- 包含检索关键词、排序模式、驱动尝试上限、实际发现数、去重数、明确可知的详情统计及内容版本哈希字典，供研究过程追溯；未观测到的内部请求数为 null。

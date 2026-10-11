@@ -180,6 +180,7 @@ def test_research_reproducibility_manifest():
     """Verify acceptance scenario: CrawlTaskManifest records complete search criteria and coverage."""
     async def _run():
         pipeline = XhsPipeline()
+        pipeline.settings["allow_synthetic"] = True
         req = CrawlRequest(
             keywords=["科研复现", "杭州"],
             max_count_per_keyword=2,
@@ -244,6 +245,7 @@ def test_resilience_budget_and_breaker():
 def test_idempotent_obsidian_preservation():
     """Verify non-destructive Obsidian updates: user manual notes are preserved upon re-export."""
     pipeline = XhsPipeline()
+    pipeline.settings["allow_synthetic"] = True
     note = UnifiedNote(
         note_id="test_preserve_01",
         title="西湖避坑指南",
@@ -288,6 +290,7 @@ def test_multi_driver_execution():
     """Verify execution of both MockDriver and HttpCrawlerDriver in XhsPipeline."""
     async def _run():
         pipeline = XhsPipeline()
+        pipeline.settings["allow_synthetic"] = True
         req = CrawlRequest(keywords=["单元测试"], max_count_per_keyword=2)
         res_mock = await pipeline.execute_crawl(req, driver_name="mock")
         assert res_mock.success is True

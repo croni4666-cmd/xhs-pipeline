@@ -1,6 +1,6 @@
 ---
 name: xhs-pipeline
-description: 小红书（Xiaohongshu）全流程智能采集、内容模式分析与 Obsidian 知识资产化管线。基于驱动契约架构（Driver Contract），实现笔记实体、访问上下文与任务状态深度分离；支持 MediaCrawler(CDP) 与纯异步 Http 异构驱动无缝切换；具备请求配额、指数退避与断路器防风控弹性治理；支持长文正文抓取、学术级可复现任务清单导出、原子文件写入与非破坏性 Obsidian 知识卡片沉淀。
+description: 小红书采集调度、数据来源记录和 Obsidian 导出管线。真实采集依赖外部 MediaCrawler；http/mock 仅提供显式许可的模拟数据。支持驱动调用预算、任务清单、字段状态、原子导出与人工批注保护。
 triggers:
   - 小红书
   - 小红书抓取
@@ -18,7 +18,7 @@ triggers:
 
 # 📕 xhs-pipeline: 小红书智能研究与资产化管线 (v0.3.2-rc3)
 
-遵循**工业级软件工程标准**与**学术可复现性规范**构建的小红书自动化数据与知识沉淀 Skill。
+预发布采集调度与知识沉淀 Skill。使用前遵守 README 和 SECURITY.md 中的当前能力边界，不将模拟数据作为真实样本，不自动发布采集结果或访问凭证。
 
 ```
 [用户/Agent 提出研究需求]
@@ -44,19 +44,14 @@ triggers:
 ## 🚀 快速启动指南 (Quick Start)
 
 ### 1. 确保浏览器调试环境就绪 (若使用 CDP 驱动)
-如果尚未启动 CDP 调试浏览器，运行项目配置的批处理脚本：
-```powershell
-# 启动带 9222 调试端口的浏览器
-.\start_edge_debug.bat
-```
-*(已登录过的用户无需再次登录，用户配置文件自动持久化)*
+本仓库不提供浏览器启动脚本。使用者应自行配置已授权的本地 CDP 浏览器与 MediaCrawler，并在本地 settings 中指定路径、解释器与端口。调试端口应仅在受控本地环境开放。
 
 ### 2. 检查驱动健康状态
 ```powershell
 # 检查默认 CDP 驱动
 python scripts/run_pipeline.py --driver mediacrawler --health-check
 
-# 检查纯 HTTP 异构驱动
+# 检查 HTTP 模拟驱动的本地初始化（不证明真实平台可达）
 python scripts/run_pipeline.py --driver http --health-check
 ```
 
@@ -66,7 +61,6 @@ python scripts/run_pipeline.py `
   --keywords "杭州美食,杭州旅游攻略" `
   --limit 20 `
   --driver mediacrawler `
-  --fallback-driver mock `
   --max-budget 50 `
   --analyze `
   --export-obsidian "./obsidian_cards" `
@@ -74,6 +68,7 @@ python scripts/run_pipeline.py `
 ```
 
 ### 4. 离线断点恢复 (零网络开销复用已有数据)
+恢复输入为原始 JSONL；依赖访问凭证的引用需重新搜索。模拟缓存必须通过统一 CLI 的 --allow-synthetic 显式许可。
 ```powershell
 python scripts/run_pipeline.py `
   --resume-from "./data/xhs/jsonl/search_contents.jsonl" `

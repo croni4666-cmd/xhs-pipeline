@@ -28,6 +28,12 @@ from ..contracts import (
 class BaseCrawlerDriver(ABC):
     """Abstract base class establishing the contract for scraper implementations."""
 
+    is_synthetic = False
+
+    @property
+    def version(self):
+        return "unknown"
+
     @property
     @abstractmethod
     def name(self) -> str:

@@ -28,6 +28,7 @@ if root_dir not in sys.path:
 
 from core.contracts import CrawlRequest, DriverError, BudgetExceededError, CircuitBreakerOpenError
 from core.pipeline import XhsPipeline
+from core.security import redact_error
 from scripts.analyze_insights import extract_insights_for_note
 
 
@@ -37,8 +38,12 @@ async def main():
     parser.add_argument("--limit", "-l", type=int, default=20, help="Max notes per keyword")
     parser.add_argument("--driver", "-d", type=str, default="mediacrawler", help="Scraper driver (mediacrawler | http | mock)")
     parser.add_argument("--fallback-driver", type=str, default="", help="Fallback driver if primary circuit breaker trips (default: none)")
-    parser.add_argument("--max-budget", type=int, default=100, help="Maximum request budget")
-    parser.add_argument("--rate-limit", type=int, default=30, help="Rate limit per minute")
+    parser.add_argument("--max-budget", type=int, default=100, help="Maximum driver attempts, including retries (not internal HTTP requests)")
+    parser.add_argument("--rate-limit", type=int, default=30, help="Driver attempts per minute")
+    parser.add_argument("--allow-synthetic", action="store_true", help="Explicitly permit labeled mock/HTTP demonstration data")
+    parser.add_argument("--settings", default=None, help="Local settings JSON")
+    parser.add_argument("--sort", default="popularity_descending", choices=["general", "popularity_descending", "latest", "time_descending"])
+    parser.add_argument("--media", action="store_true", help="Enable media download in the external driver")
     parser.add_argument("--resume-from", "-r", type=str, default="", help="Resume downstream processing from raw JSONL file")
     parser.add_argument("--comments", action="store_true", help="Enable comment scraping")
     parser.add_argument("--analyze", action="store_true", help="Run empirical pattern and insight extraction")
@@ -49,7 +54,11 @@ async def main():
     parser.add_argument("--health-check", action="store_true", help="Run driver health check and exit")
 
     args = parser.parse_args()
-    pipeline = XhsPipeline()
+    if args.limit < 1 or args.max_budget < 0 or args.rate_limit < 1:
+        parser.error("limit/rate-limit must be positive and max-budget nonnegative")
+    pipeline = XhsPipeline(args.settings) if args.settings else XhsPipeline()
+    if args.allow_synthetic and hasattr(pipeline, "settings"):
+        pipeline.settings["allow_synthetic"] = True
 
     # Configure budget and rate limit from CLI args
     pipeline.budget_manager.max_budget = args.max_budget
@@ -79,9 +88,9 @@ async def main():
             sys.exit(0 if healthy else 2)
         except Exception as e:
             if args.format == "json":
-                print(json.dumps({"driver": args.driver, "healthy": False, "error": str(e)}))
+                print(json.dumps({"driver": args.driver, "healthy": False, "error": redact_error(e)}))
             else:
-                print(f"[x] Health check error: {e}")
+                print(f"[x] Health check error: {redact_error(e)}")
             sys.exit(2)
 
     notes = []
@@ -94,14 +103,14 @@ async def main():
         if args.format != "json":
             print(f"[*] Resuming from existing cache: {args.resume_from}")
         try:
-            notes = pipeline.load_from_jsonl(args.resume_from)
+            notes = pipeline.load_from_jsonl(args.resume_from, allow_synthetic=args.allow_synthetic)
             if args.format != "json":
                 print(f"[√] Loaded {len(notes)} cached notes successfully.")
         except Exception as e:
             if args.format == "json":
-                print(json.dumps({"error": f"Failed loading cache: {str(e)}"}))
+                print(json.dumps({"error": f"Failed loading cache: {redact_error(e)}"}))
             else:
-                print(f"[x] Failed loading cache: {e}")
+                print(f"[x] Failed loading cache: {redact_error(e)}")
             sys.exit(1)
 
     # 3. Live Crawl Mode
@@ -110,7 +119,8 @@ async def main():
         request = CrawlRequest(
             keywords=keywords,
             max_count_per_keyword=args.limit,
-            enable_comments=args.comments
+            enable_comments=args.comments, enable_media=args.media,
+            sort_type=args.sort, allow_synthetic=args.allow_synthetic
         )
         if args.format != "json":
             print(f"[*] Starting crawl via driver '{args.driver}' (fallback: '{args.fallback_driver}')...")
@@ -123,7 +133,7 @@ async def main():
                 fallback_driver=args.fallback_driver
             )
             notes = response.notes
-            crawl_errors = response.errors
+            crawl_errors = [redact_error(error) for error in response.errors]
             is_partial = response.is_partial
             crawl_success = response.success
             if args.format != "json":
@@ -132,27 +142,27 @@ async def main():
                     print(f"[!] Warnings: {'; '.join(crawl_errors)}")
         except BudgetExceededError as e:
             if args.format == "json":
-                print(json.dumps({"error": "BudgetExceededError", "message": str(e)}))
+                print(json.dumps({"error": "BudgetExceededError", "message": redact_error(e)}))
             else:
-                print(f"[!] Budget exceeded: {e}")
+                print(f"[!] Budget exceeded: {redact_error(e)}")
             sys.exit(1)
         except CircuitBreakerOpenError as e:
             if args.format == "json":
-                print(json.dumps({"error": "CircuitBreakerOpenError", "message": str(e)}))
+                print(json.dumps({"error": "CircuitBreakerOpenError", "message": redact_error(e)}))
             else:
-                print(f"[x] Circuit breaker open: {e}")
+                print(f"[x] Circuit breaker open: {redact_error(e)}")
             sys.exit(2)
         except DriverError as e:
             if args.format == "json":
-                print(json.dumps({"error": "DriverError", "message": str(e)}))
+                print(json.dumps({"error": "DriverError", "message": redact_error(e)}))
             else:
-                print(f"[x] Driver error: {e}")
+                print(f"[x] Driver error: {redact_error(e)}")
             sys.exit(2)
         except Exception as e:
             if args.format == "json":
-                print(json.dumps({"error": "UnexpectedError", "message": str(e)}))
+                print(json.dumps({"error": "UnexpectedError", "message": redact_error(e)}))
             else:
-                print(f"[x] Pipeline unexpected error: {e}")
+                print(f"[x] Pipeline unexpected error: {redact_error(e)}")
             sys.exit(2)
     else:
         if args.format == "json":
@@ -178,7 +188,8 @@ async def main():
             print(f"[√] Exported CSV to: {created_csv}")
 
     if args.export_obsidian:
-        created_cards = pipeline.export_obsidian_cards(notes, args.export_obsidian)
+        export_task = response.manifest.task_id if not args.resume_from and getattr(response, "manifest", None) else "cache_export"
+        created_cards = pipeline.export_obsidian_cards(notes, args.export_obsidian, task_id=export_task)
         if args.format != "json":
             print(f"[√] Generated/Updated {len(created_cards)} idempotent Obsidian cards in: {args.export_obsidian}")
 
@@ -199,6 +210,8 @@ async def main():
             "success": overall_success,
             "total_notes": len(notes),
             "is_partial": is_partial,
+            "is_synthetic": any(note.is_synthetic for note in notes),
+            "data_sources": sorted({note.data_source for note in notes}),
             "errors": crawl_errors,
             "csv_path": created_csv,
             "obsidian_cards_count": len(created_cards),
@@ -226,7 +239,11 @@ def cli_entrypoint():
     except SystemExit as e:
         sys.exit(e.code)
     except Exception as e:
-        sys.stderr.write(f"Fatal error: {e}\n")
+        message = redact_error(e)
+        if "json" in sys.argv and ("--format" in sys.argv or "-f" in sys.argv):
+            print(json.dumps({"success": False, "error": type(e).__name__, "message": message}, ensure_ascii=False))
+        else:
+            sys.stderr.write(f"Fatal error: {message}\n")
         sys.exit(1)
 
 

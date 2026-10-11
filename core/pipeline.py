@@ -12,6 +12,8 @@ and non-destructive Obsidian markdown updates by delegating to dedicated compone
 import os
 import json
 import time
+import hashlib
+from dataclasses import asdict
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
@@ -31,7 +33,8 @@ from .contracts import (
     RateLimitError,
     AuthenticationError,
     BudgetExceededError,
-    CircuitBreakerOpenError
+    CircuitBreakerOpenError,
+    CapabilityUnsupportedError, DriverError
 )
 from .drivers.base import BaseCrawlerDriver
 from .drivers.mediacrawler import MediaCrawlerDriver
@@ -54,7 +57,7 @@ class XhsPipeline:
         max_budget = int(self.settings.get("max_request_budget", 100))
         rate_limit = int(self.settings.get("rate_limit_per_minute", 30))
         self.budget_manager = RequestBudgetManager(max_budget=max_budget, rate_limit_per_min=rate_limit)
-        self.backoff = ExponentialBackoff(initial_delay=1.0, factor=2.0, max_retries=3)
+        self.backoff = ExponentialBackoff(initial_delay=1.0, factor=2.0, max_retries=int(self.settings.get("retry_attempts", 3)))
 
         # 2. Storage & checkpoint stores
         state_dir = self.settings.get("checkpoint_dir", "./data/checkpoints")
@@ -72,7 +75,10 @@ class XhsPipeline:
                 with open(target_path, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
-                pass
+                if path is not None:
+                    raise PipelineError("Explicit settings file is invalid")
+        elif path is not None:
+            raise PipelineError("Explicit settings file does not exist")
         example_path = os.path.join(os.path.dirname(__file__), "..", "config", "settings.example.json")
         if os.path.exists(example_path):
             try:
@@ -80,18 +86,14 @@ class XhsPipeline:
                     return json.load(f)
             except Exception:
                 pass
-        return {
-            "active_driver": "mediacrawler",
-            "fallback_driver": None,
-            "max_request_budget": 100,
-            "rate_limit_per_minute": 30,
-            "obsidian_vault_dir": os.environ.get("OBSIDIAN_VAULT_DIR", "./obsidian_cards"),
-            "checkpoint_dir": "./data/checkpoints"
-        }
+        from importlib.resources import files
+        defaults = json.loads(files("core").joinpath("resources/settings.example.json").read_text(encoding="utf-8"))
+        defaults["obsidian_vault_dir"] = os.environ.get("OBSIDIAN_VAULT_DIR", defaults["obsidian_vault_dir"])
+        return defaults
 
     def _register_default_drivers(self):
         self.register_driver(MediaCrawlerDriver(self.settings))
-        self.register_driver(MockDriver())
+        self.register_driver(MockDriver(self.settings))
         self.register_driver(HttpCrawlerDriver(self.settings))
 
     def register_driver(self, driver: BaseCrawlerDriver):
@@ -104,171 +106,159 @@ class XhsPipeline:
             raise PipelineError(f"Driver '{driver_name}' not found. Available: {list(self.drivers.keys())}")
         return driver
 
-    async def execute_crawl(
-        self,
-        request: CrawlRequest,
-        driver_name: Optional[str] = None,
-        fallback_driver: Optional[str] = None
-    ) -> CrawlResponse:
-        """
-        Executes search/crawl governed by budget limits, circuit breakers,
-        and automatic driver failover. Saves complete task manifest for reproduction.
-        """
-        await self.budget_manager.acquire()
+    async def execute_crawl(self, request, driver_name=None, fallback_driver=None):
+        import asyncio
+        from . import __version__
+        from .security import public_config, redact_error
+        started = time.time()
+        primary = driver_name or self.settings.get("active_driver", "mediacrawler")
+        fallback = fallback_driver if fallback_driver is not None else self.settings.get("fallback_driver")
+        fallback = fallback or None
+        allowed = request.allow_synthetic is True or self.settings.get("allow_synthetic") is True
+        attempts, diagnostics, used_drivers = [], [], {}
+        response, active, stop_reason, raw_count = None, primary, "failed", 0
+        request_snapshot = {"keywords": list(request.keywords), "limit_per_keyword": request.max_count_per_keyword,
+                            "sort_type": request.sort_type, "comments": request.enable_comments,
+                            "media": request.enable_media, "allow_synthetic": allowed}
+        effective = {"request": request_snapshot, "settings": public_config(self.settings)}
+        config_fingerprint = hashlib.sha256(json.dumps(effective, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
-        selected_primary = driver_name or self.settings.get("active_driver", "mediacrawler")
-        selected_fallback = fallback_driver if fallback_driver is not None else self.settings.get("fallback_driver")
-        if not selected_fallback:
-            selected_fallback = None
+        async def invoke(name):
+            nonlocal active
+            active = name
+            driver = self.get_driver(name)
+            used_drivers[name] = driver
+            if getattr(driver, "is_synthetic", False) and not allowed:
+                raise CapabilityUnsupportedError("Synthetic drivers require explicit allow_synthetic consent")
+            breaker = self.router.get_circuit_breaker(name)
+            backoff = getattr(self, "backoff", ExponentialBackoff(max_retries=1))
 
-        if not hasattr(self, "router") or self.router is None:
-            self.router = DriverFallbackRouter(primary_driver=selected_primary, fallback_driver=selected_fallback)
-        else:
-            self.router.primary_driver = selected_primary
-            self.router.fallback_driver = selected_fallback
-
-        router = self.router
-        active_name = router.select_healthy_driver()
-        driver = self.get_driver(active_name)
-        cb = router.get_circuit_breaker(active_name)
-
-        started_at = time.time()
-        response: Optional[CrawlResponse] = None
-        actual_driver_used = active_name
+            async def attempt():
+                if not breaker.can_execute():
+                    raise CircuitBreakerOpenError("Driver circuit is open")
+                await self.budget_manager.acquire()
+                record = {"driver": name, "started_at": time.time(), "status": "pending", "actual_request_count": None}
+                attempts.append(record)
+                try:
+                    result = await driver.crawl_keywords(request)
+                    if not isinstance(result, CrawlResponse):
+                        raise DriverError("Driver returned an invalid response")
+                    if (result.is_synthetic or any(n.is_synthetic for n in result.notes)) and not allowed:
+                        raise CapabilityUnsupportedError("Synthetic response rejected by pipeline")
+                    result.errors = [redact_error(error) for error in result.errors]
+                    count = result.actual_request_count
+                    result.actual_request_count = count if type(count) is int and count >= 0 else None
+                    record["actual_request_count"] = result.actual_request_count
+                    record["status"] = "success" if result.success else "failed"
+                    if result.success:
+                        breaker.record_success()
+                    else:
+                        breaker.record_failure()
+                    return result
+                except BaseException as exc:
+                    breaker.record_failure()
+                    record["status"] = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                    record["error"] = redact_error(str(exc) or type(exc).__name__)
+                    raise
+                finally:
+                    record["completed_at"] = time.time()
+            return await backoff.execute(attempt)
 
         try:
-            response = await driver.crawl_keywords(request)
-            cb.record_success()
-            actual_driver_used = response.driver_name or active_name
-        except (RateLimitError, AuthenticationError) as e:
-            cb.record_failure()
-            if selected_fallback and active_name != selected_fallback:
-                fallback_driver_inst = self.get_driver(selected_fallback)
-                fb_cb = router.get_circuit_breaker(selected_fallback)
-                try:
-                    await self.budget_manager.acquire()
-                    response = await fallback_driver_inst.crawl_keywords(request)
-                    fb_cb.record_success()
-                    actual_driver_used = selected_fallback
-                    response.driver_name = selected_fallback
-                    response.errors.append(f"Primary driver '{active_name}' failed ({str(e)}). Switched to '{selected_fallback}'.")
-                except Exception as fb_err:
-                    fb_cb.record_failure()
-                    raise PipelineError(f"Both primary '{active_name}' and fallback '{selected_fallback}' failed: {fb_err}")
-            else:
-                raise
-        except Exception:
-            cb.record_failure()
+            if not getattr(self, "router", None):
+                self.router = DriverFallbackRouter(primary, fallback)
+            self.router.primary_driver, self.router.fallback_driver = primary, fallback
+            active = self.router.select_healthy_driver()
+            try:
+                response = await invoke(active)
+            except (AuthenticationError, RateLimitError, CircuitBreakerOpenError) as exc:
+                if not fallback or active == fallback:
+                    raise
+                diagnostics.append(redact_error(f"Primary driver failed: {exc}"))
+                response = await invoke(fallback)
+            if response is not None and not response.success and fallback and active != fallback:
+                diagnostics.extend(response.errors)
+                response = await invoke(fallback)
+            response.driver_name = active
+            raw_count = len(response.notes)
+            response.notes = self.cleaner.deduplicate_notes(response.notes)
+            response.total_notes = len(response.notes)
+            response.errors = diagnostics + response.errors
+            response.is_synthetic = response.is_synthetic or any(n.is_synthetic for n in response.notes)
+            stop_reason = "failed" if not response.success else "partial_success" if response.is_partial else "completed"
+            return response
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                stop_reason = "cancelled"
+            elif isinstance(exc, BudgetExceededError):
+                stop_reason = "budget_exceeded"
+            elif isinstance(exc, AuthenticationError):
+                stop_reason = "authentication_required"
+            elif isinstance(exc, RateLimitError):
+                stop_reason = "rate_limited"
+            elif isinstance(exc, CircuitBreakerOpenError):
+                stop_reason = "circuit_open"
+            elif isinstance(exc, CapabilityUnsupportedError):
+                stop_reason = "unsupported"
+            diagnostics.append(redact_error(str(exc) or type(exc).__name__))
             raise
+        finally:
+            for driver in used_drivers.values():
+                try:
+                    await driver.close()
+                except Exception as exc:
+                    diagnostics.append(redact_error(f"Driver cleanup failed: {exc}"))
+                    if response and response.success:
+                        response.is_partial = True
+                        stop_reason = "partial_success"
+            for name, driver in used_drivers.items():
+                effective[name] = public_config(getattr(driver, "effective_config", getattr(driver, "config", getattr(driver, "cfg", {}))))
+            config_fingerprint = hashlib.sha256(json.dumps(effective, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            notes = response.notes if response else []
+            trails = [{"note_id": n.note_id, **asdict(event)} for n in notes for event in n.discovery_records]
+            reported = [a["actual_request_count"] for a in attempts]
+            actual_count = sum(reported) if reported and all(type(v) is int and v >= 0 for v in reported) else None
+            stats = {**self.budget_manager.get_stats(), "budget_unit": "driver_attempt",
+                     "task_driver_attempts": len(attempts)}
+            manifest = CrawlTaskManifest(
+                task_id=request.task_id, driver_name=active,
+                driver_version=getattr(used_drivers.get(active), "version", "unknown"),
+                pipeline_version=__version__, started_at=started, completed_at=time.time(),
+                keywords=list(request.keywords), sort_type=request.sort_type,
+                request_quota=request.max_count_per_keyword * len(request.keywords),
+                actual_discovered_count=raw_count if response else 0, deduplicated_count=len(notes),
+                detail_success_count=response.detail_success_count if response else 0,
+                detail_failed_count=response.detail_failed_count if response else 0,
+                stop_reason=stop_reason, filter_criteria={"sort_type": request.sort_type, "comments": request.enable_comments, "media": request.enable_media},
+                discovery_trails=trails, content_hashes={n.note_id: n.content_hash for n in notes},
+                effective_config=effective, config_fingerprint=config_fingerprint,
+                driver_attempts=attempts, budget_stats=stats, actual_request_count=actual_count,
+                is_synthetic=bool(response and response.is_synthetic),
+                data_source=response.data_source if response else "unknown",
+                errors=[redact_error(error) for error in diagnostics + (response.errors if response else [])],
+            )
+            if response:
+                response.manifest = manifest
+            self.checkpoint_store.save_task_manifest(manifest)
+            # Always replace the current task's references, even when this attempt found none.
+            self.checkpoint_store.save_references(request.task_id, response.references if response else [])
 
-        # Deduplicate notes across multi-keyword queries and merge discovery records
-        raw_count = len(response.notes)
-        deduped_notes = self.cleaner.deduplicate_notes(response.notes)
-        response.notes = deduped_notes
-        response.total_notes = len(deduped_notes)
-
-        # Build research reproducibility manifest
-        if not response.success:
-            stop_reason = "failed"
-        elif response.is_partial:
-            stop_reason = "partial_success"
-        else:
-            stop_reason = "completed"
-
-        trails = []
-        for n in deduped_notes:
-            for d in n.discovery_records:
-                trails.append({
-                    "keyword": d.keyword,
-                    "rank": d.rank,
-                    "note_id": n.note_id,
-                    "source_type": d.source_type,
-                    "discovered_at": d.discovered_at
-                })
-
-        manifest = CrawlTaskManifest(
-            task_id=request.task_id,
-            driver_name=actual_driver_used,
-            driver_version="0.3.2rc3",
-            pipeline_version="0.3.2rc3",
-            started_at=started_at,
-            completed_at=time.time(),
-            keywords=list(request.keywords),
-            sort_type=request.sort_type,
-            request_quota=request.max_count_per_keyword * len(request.keywords),
-            actual_discovered_count=raw_count,
-            deduplicated_count=len(deduped_notes),
-            detail_success_count=0,
-            detail_failed_count=0,
-            stop_reason=stop_reason,
-            filter_criteria={"sort_type": request.sort_type, "comments": request.enable_comments},
-            discovery_trails=trails,
-            content_hashes={n.note_id: n.content_hash for n in deduped_notes}
-        )
-        response.manifest = manifest
-
-        # Persist task manifest & references to checkpoint store
-        self.checkpoint_store.save_task_manifest(manifest)
-        if response.references:
-            self.checkpoint_store.save_references(request.task_id, response.references)
-
-        return response
-
-    def load_from_jsonl(self, jsonl_path: str) -> List[UnifiedNote]:
-        """
-        Failure Recovery: Ingest raw JSONL cache and clean/deduplicate.
-        """
-        if not os.path.exists(jsonl_path):
-            raise FileNotFoundError(f"JSONL cache file not found: {jsonl_path}")
-
-        raw_notes: List[UnifiedNote] = []
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
+    def load_from_jsonl(self, jsonl_path, allow_synthetic=False):
+        from .normalizer import normalize_raw_note
+        raw_notes = []
+        with open(jsonl_path, encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
                 if not line.strip():
                     continue
                 try:
                     raw = json.loads(line)
-                    tags = [t.strip() for t in raw.get("tag_list", "").split(",") if t.strip()]
-                    images = [img.strip() for img in raw.get("image_list", "").split(",") if img.strip()]
-
-                    metrics = EngagementMetrics.from_raw(
-                        likes=raw.get("liked_count"),
-                        collects=raw.get("collected_count"),
-                        comments=raw.get("comment_count"),
-                        shares=raw.get("share_count")
-                    )
-
-                    desc_text = str(raw.get("desc", ""))
-                    note_type = str(raw.get("type", "normal"))
-                    comp = self.cleaner.evaluate_completeness(note_type, desc_text)
-                    raw_url = str(raw.get("note_url", ""))
-                    clean_url = raw_url.split("?")[0] if "?" in raw_url else raw_url
-                    note_id = str(raw.get("note_id", ""))
-
-                    note = UnifiedNote(
-                        note_id=note_id,
-                        title=str(raw.get("title", "")),
-                        desc=desc_text,
-                        completeness=comp,
-                        desc_presence=FieldPresence.VALID if desc_text else FieldPresence.KNOWN_EMPTY,
-                        note_type=note_type,
-                        author_id=str(raw.get("creator_hash", "")),
-                        author_name=str(raw.get("nickname", "匿名用户")),
-                        metrics=metrics,
-                        url=clean_url or f"https://www.xiaohongshu.com/explore/{note_id}",
-                        tag_list=tags,
-                        image_list=images,
-                        video_url=str(raw.get("video_url", "")),
-                        published_at=raw.get("time"),
-                        stage_status=StageStatus.CRAWLED
-                    )
-                    kw = str(raw.get("source_keyword", ""))
-                    if kw:
-                        note.add_discovery(keyword=kw)
-                    raw_notes.append(note)
-                except Exception:
-                    continue
-
+                    raw_notes.append(normalize_raw_note(raw, keyword=raw.get("source_keyword"),
+                                                        data_source="jsonl_cache"))
+                except (ValueError, TypeError, AttributeError) as exc:
+                    raise PipelineError(f"Invalid JSONL record at line {line_number}") from exc
+        if not (allow_synthetic is True or getattr(self, "settings", {}).get("allow_synthetic") is True):
+            if any(n.is_synthetic or n.data_source in ("mock", "synthetic_simulation") for n in raw_notes):
+                raise CapabilityUnsupportedError("Cached synthetic data requires explicit consent")
         return self.cleaner.deduplicate_notes(raw_notes)
 
     def export_csv(self, notes: List[UnifiedNote], output_path: str) -> str:
@@ -294,44 +284,20 @@ class XhsPipeline:
         reconciled = self.checkpoint_store.reconcile_after_crash(task_id, target_dir, notes)
 
         for note in notes:
-            existing_file = exporter._find_existing_file(note.note_id)
-            if existing_file and reconciled.get(note.note_id) == StageStatus.EXPORTED:
-                # Double-check that disk file has not been tampered
-                commit_info = self.checkpoint_store.get_commit(task_id, note.note_id) if hasattr(self.checkpoint_store, "get_commit") else None
-                if commit_info and commit_info.get("artifact_hash"):
-                    try:
-                        cur_disk_hash = hashlib.sha256(Path(existing_file).read_bytes()).hexdigest()
-                        if cur_disk_hash != commit_info["artifact_hash"]:
-                            existing_file = None
-                    except OSError:
-                        existing_file = None
-
-                if existing_file:
-                    written_files.append(existing_file)
-                    continue
-
-            file_path, written_hash = exporter.export_note(note)
-            written_files.append(file_path)
-            render_hash = note.get_render_input_hash() if hasattr(note, "get_render_input_hash") else ""
-            self.checkpoint_store.commit_export(
-                task_id=task_id,
-                note_id=note.note_id,
-                file_path=file_path,
-                source_hash=note.content_hash,
-                artifact_hash=written_hash,
-                render_input_hash=render_hash
-            )
+            with exporter.card_lock(note.note_id):
+                file_path, written_hash = exporter.export_note(note)
+                written_files.append(file_path)
+                render_hash = note.get_render_input_hash()
+                previous = self.checkpoint_store.get_commit(task_id, note.note_id)
+                current = {"file_path": file_path, "source_hash": note.content_hash,
+                           "artifact_hash": written_hash, "render_input_hash": render_hash}
+                if not previous or any(previous.get(key) != value for key, value in current.items()):
+                    self.checkpoint_store.commit_export(task_id, note.note_id, **current)
 
         return written_files
 
     def save_state(self, notes: List[UnifiedNote], file_path: str) -> str:
         """Atomically saves pipeline execution state to JSON."""
-        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
         payload = [n.to_dict() for n in notes]
-        temp_file = f"{file_path}.{os.getpid()}_{time.time_ns()}.tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_file, file_path)
+        self.checkpoint_store._atomic_write_json(str(file_path), payload)
         return file_path

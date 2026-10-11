@@ -5,6 +5,7 @@ Synthetic data provider for offline testing and continuous integration without b
 """
 
 import asyncio
+import hashlib
 from typing import Optional, List, Union
 from .base import BaseCrawlerDriver
 from ..contracts import (
@@ -15,12 +16,18 @@ from ..contracts import (
     EngagementMetrics,
     ContentCompleteness,
     DriverCapabilities,
-    ReferenceExpiredError
+    ReferenceExpiredError,
+    CapabilityUnsupportedError
 )
 
 
 class MockDriver(BaseCrawlerDriver):
     """Synthetic test driver for offline development, contract verification, and CI."""
+
+    is_synthetic = True
+
+    def __init__(self, config=None):
+        self.config = config or {}
 
     @property
     def name(self) -> str:
@@ -41,13 +48,15 @@ class MockDriver(BaseCrawlerDriver):
         return True
 
     async def crawl_keywords(self, request: CrawlRequest) -> CrawlResponse:
+        if not (request.allow_synthetic or self.config.get("allow_synthetic", False)):
+            raise CapabilityUnsupportedError("Mock data requires explicit allow_synthetic consent")
         await asyncio.sleep(0.01)
         notes: List[UnifiedNote] = []
         references: List[NoteReference] = []
 
         for kw in request.keywords:
             for i in range(1, min(request.max_count_per_keyword, 5) + 1):
-                note_id = f"mock_{kw}_{i}"
+                note_id = f"mock_{hashlib.sha256(kw.encode()).hexdigest()[:16]}_{i}"
                 note = UnifiedNote(
                     note_id=note_id,
                     title=f"【测试样板】关于 {kw} 的深度评测 #{i}",
@@ -62,9 +71,10 @@ class MockDriver(BaseCrawlerDriver):
                         comments=f"{i * 45}",
                         shares=f"{i * 12}"
                     ),
-                    url=f"https://www.xiaohongshu.com/explore/{note_id}",
+                    url=f"https://example.invalid/mock/{note_id}",
                     tag_list=["测试", kw, "热门打卡"],
-                    image_list=["https://example.com/mock.jpg"]
+                    image_list=["https://example.com/mock.jpg"],
+                    is_synthetic=True, data_source="mock"
                 )
                 note.add_discovery(keyword=kw, rank=i)
                 notes.append(note)
@@ -88,7 +98,7 @@ class MockDriver(BaseCrawlerDriver):
             driver_name=self.name,
             total_notes=len(notes),
             notes=notes,
-            references=references
+            references=references, is_synthetic=True, data_source="mock", actual_request_count=0
         )
 
     async def get_note_detail(self, target: Union[str, NoteReference]) -> Optional[UnifiedNote]:
@@ -96,6 +106,8 @@ class MockDriver(BaseCrawlerDriver):
 
         if isinstance(target, NoteReference) and target.is_expired():
             raise ReferenceExpiredError(f"Access token for note {note_id} has expired.", note_id=note_id)
+        if not self.config.get("allow_synthetic", False):
+            raise CapabilityUnsupportedError("Mock detail requires explicit allow_synthetic consent")
 
         note = UnifiedNote(
             note_id=note_id,
@@ -106,7 +118,8 @@ class MockDriver(BaseCrawlerDriver):
             author_id="author_mock",
             author_name="测试作者",
             metrics=EngagementMetrics.from_raw(100, 50, 20, 5),
-            url=f"https://www.xiaohongshu.com/explore/{note_id}"
+            url=f"https://example.invalid/mock/{note_id}",
+            is_synthetic=True, data_source="mock"
         )
         if isinstance(target, NoteReference) and target.discovered_keyword:
             note.add_discovery(keyword=target.discovered_keyword, rank=target.rank, source_type="reference")

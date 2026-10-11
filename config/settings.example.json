@@ -1,6 +1,9 @@
 {
   "active_driver": "mediacrawler",
   "fallback_driver": null,
+  "allow_synthetic": false,
+  "retry_attempts": 3,
+  "crawl_timeout_seconds": 300,
   "mediacrawler_path": "./MediaCrawler",
   "python_path": "python",
   "cdp_port": 9222,

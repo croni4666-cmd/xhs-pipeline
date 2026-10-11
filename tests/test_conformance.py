@@ -114,13 +114,13 @@ async def verify_driver_contract(driver: BaseCrawlerDriver):
 
 
 def test_mock_driver_conformance():
-    driver = MockDriver()
+    driver = MockDriver({"allow_synthetic": True})
     asyncio.run(verify_driver_contract(driver))
     print("[√] Driver conformance passed for MockDriver (including ReferenceExpired & Cancellation)!")
 
 
 def test_http_driver_conformance():
-    driver = HttpCrawlerDriver({"timeout_seconds": 5.0})
+    driver = HttpCrawlerDriver({"timeout_seconds": 5.0, "allow_synthetic": True})
     assert driver.capabilities.requires_browser is False
     asyncio.run(verify_driver_contract(driver))
     print("[√] Driver conformance passed for HttpCrawlerDriver (browserless)!")
