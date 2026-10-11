@@ -35,6 +35,7 @@ from .pipeline import XhsPipeline
 from .normalizer import DataCleaner
 from .storage import ObsidianExporter, CsvExporter
 from .checkpoint import CheckpointStore
+from .snapshot import SnapshotError
 from .drivers.base import BaseCrawlerDriver
 from .drivers.mediacrawler import MediaCrawlerDriver
 from .drivers.mock_driver import MockDriver
@@ -70,6 +71,7 @@ __all__ = [
     "ObsidianExporter",
     "CsvExporter",
     "CheckpointStore",
+    "SnapshotError",
     "BaseCrawlerDriver",
     "MediaCrawlerDriver",
     "MockDriver",

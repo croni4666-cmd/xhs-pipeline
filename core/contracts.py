@@ -549,6 +549,9 @@ class CrawlTaskManifest:
     data_source: str = "unknown"
     is_synthetic: bool = False
     errors: List[str] = field(default_factory=list)
+    operation: str = "crawl"
+    parent_task_id: Optional[str] = None
+    source_snapshot_hash: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -608,3 +611,5 @@ class CrawlResponse:
     detail_success_count: Optional[int] = 0
     detail_failed_count: Optional[int] = 0
     actual_request_count: Optional[int] = None
+    snapshot_lineage: List[CrawlTaskManifest] = field(default_factory=list)
+    snapshot_hash: str = ""

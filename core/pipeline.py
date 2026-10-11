@@ -301,3 +301,63 @@ class XhsPipeline:
         payload = [n.to_dict() for n in notes]
         self.checkpoint_store._atomic_write_json(str(file_path), payload)
         return file_path
+
+    def save_task_snapshot(self, response: CrawlResponse, file_path: str) -> str:
+        from .snapshot import save_snapshot
+        return save_snapshot(response, file_path)
+
+    def load_task_snapshot(self, file_path: str, *, allow_synthetic=False) -> CrawlResponse:
+        from .snapshot import load_snapshot
+        allowed = allow_synthetic is True or self.settings.get('allow_synthetic') is True
+        return load_snapshot(file_path, allow_synthetic=allowed)
+
+    def _record_offline_response(self, response, operation):
+        """Record a downstream operation separately from the original capture."""
+        from copy import deepcopy
+        import uuid
+        from . import __version__
+        from .security import public_config, redact_error
+        parent = response.manifest
+        if parent is not None:
+            response.snapshot_lineage.append(deepcopy(parent))
+        started = time.time()
+        response.driver_name = 'offline_snapshot' if operation == 'offline_resume' else 'offline_jsonl'
+        response.references, response.output_files = [], {}
+        response.actual_request_count = 0
+        response.detail_success_count, response.detail_failed_count = 0, 0
+        response.total_notes = len(response.notes)
+        response.is_synthetic = response.is_synthetic or any(note.is_synthetic for note in response.notes)
+        response.errors = [redact_error(error) for error in response.errors]
+        effective = {'operation': operation, 'settings': public_config(self.settings),
+                     'source_snapshot_hash': response.snapshot_hash, 'parent_task_id': parent.task_id if parent else None}
+        manifest = CrawlTaskManifest(
+            task_id='task_' + uuid.uuid4().hex, driver_name=response.driver_name, driver_version=__version__,
+            pipeline_version=__version__, started_at=started, completed_at=time.time(),
+            keywords=list(parent.keywords) if parent else [], sort_type=parent.sort_type if parent else 'unknown',
+            request_quota=0, actual_discovered_count=0, deduplicated_count=len(response.notes),
+            detail_success_count=0, detail_failed_count=0,
+            stop_reason='source_failed' if not response.success else 'partial_success' if response.is_partial else 'completed',
+            filter_criteria=deepcopy(parent.filter_criteria) if parent else {},
+            discovery_trails=[{'note_id': note.note_id, **asdict(event)} for note in response.notes for event in note.discovery_records],
+            content_hashes={note.note_id: note.content_hash for note in response.notes}, effective_config=effective,
+            config_fingerprint=hashlib.sha256(json.dumps(effective, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+            budget_stats={**self.budget_manager.get_stats(), 'task_driver_attempts': 0}, actual_request_count=0,
+            data_source=response.data_source, is_synthetic=response.is_synthetic, errors=list(response.errors),
+            operation=operation, parent_task_id=parent.task_id if parent else None,
+            source_snapshot_hash=response.snapshot_hash,
+        )
+        self.checkpoint_store.save_task_manifest(manifest)
+        self.checkpoint_store.save_references(manifest.task_id, [])
+        response.manifest = manifest
+        return response
+
+    def resume_task_snapshot(self, file_path: str, *, allow_synthetic=False) -> CrawlResponse:
+        """Restore facts and inferences offline; retain original status and capture lineage."""
+        response = self.load_task_snapshot(file_path, allow_synthetic=allow_synthetic)
+        return self._record_offline_response(response, 'offline_resume')
+
+    def import_jsonl_task(self, file_path: str, *, allow_synthetic=False) -> CrawlResponse:
+        notes = self.load_from_jsonl(file_path, allow_synthetic=allow_synthetic)
+        response = CrawlResponse(True, 'offline_jsonl', len(notes), notes, data_source='jsonl_cache',
+                                 is_synthetic=any(note.is_synthetic for note in notes), actual_request_count=0)
+        return self._record_offline_response(response, 'jsonl_import')

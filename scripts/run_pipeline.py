@@ -26,7 +26,7 @@ root_dir = str(Path(__file__).resolve().parent.parent)
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-from core.contracts import CrawlRequest, DriverError, BudgetExceededError, CircuitBreakerOpenError
+from core.contracts import CrawlRequest, CrawlResponse, DriverError, BudgetExceededError, CircuitBreakerOpenError, StageStatus
 from core.pipeline import XhsPipeline
 from core.security import redact_error
 from scripts.analyze_insights import extract_insights_for_note
@@ -34,7 +34,8 @@ from scripts.analyze_insights import extract_insights_for_note
 
 async def main():
     parser = argparse.ArgumentParser(description="Xiaohongshu Research & Scraping Pipeline")
-    parser.add_argument("--keywords", "-k", type=str, default="", help="Comma-separated keywords")
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--keywords", "-k", type=str, default="", help="Comma-separated keywords")
     parser.add_argument("--limit", "-l", type=int, default=20, help="Max notes per keyword")
     parser.add_argument("--driver", "-d", type=str, default="mediacrawler", help="Scraper driver (mediacrawler | http | mock)")
     parser.add_argument("--fallback-driver", type=str, default="", help="Fallback driver if primary circuit breaker trips (default: none)")
@@ -44,18 +45,22 @@ async def main():
     parser.add_argument("--settings", default=None, help="Local settings JSON")
     parser.add_argument("--sort", default="popularity_descending", choices=["general", "popularity_descending", "latest", "time_descending"])
     parser.add_argument("--media", action="store_true", help="Enable media download in the external driver")
-    parser.add_argument("--resume-from", "-r", type=str, default="", help="Resume downstream processing from raw JSONL file")
+    inputs.add_argument("--resume-from", "-r", type=str, default="", help="Resume downstream processing from raw JSONL file")
+    inputs.add_argument("--resume-state", type=str, default="", help="Recover a complete task snapshot offline")
     parser.add_argument("--comments", action="store_true", help="Enable comment scraping")
     parser.add_argument("--analyze", action="store_true", help="Run empirical pattern and insight extraction")
     parser.add_argument("--export-csv", type=str, default="", help="Export CSV path")
     parser.add_argument("--export-obsidian", type=str, default="", help="Export Obsidian cards directory")
     parser.add_argument("--state-file", type=str, default="", help="Path to save pipeline execution state JSON")
+    parser.add_argument("--snapshot-file", type=str, default="", help="Save a complete versioned task snapshot without access credentials")
     parser.add_argument("--format", "-f", choices=["text", "json"], default="text", help="Output format (text | json)")
     parser.add_argument("--health-check", action="store_true", help="Run driver health check and exit")
 
     args = parser.parse_args()
     if args.limit < 1 or args.max_budget < 0 or args.rate_limit < 1:
         parser.error("limit/rate-limit must be positive and max-budget nonnegative")
+    if args.health_check and (args.keywords or args.resume_from or args.resume_state):
+        parser.error("health-check cannot be combined with a capture or recovery input")
     pipeline = XhsPipeline(args.settings) if args.settings else XhsPipeline()
     if args.allow_synthetic and hasattr(pipeline, "settings"):
         pipeline.settings["allow_synthetic"] = True
@@ -97,18 +102,25 @@ async def main():
     crawl_errors = []
     is_partial = False
     crawl_success = True
+    response = None
 
     # 2. Failure Recovery Mode (Resume from file)
-    if args.resume_from:
+    if args.resume_state or args.resume_from:
         if args.format != "json":
-            print(f"[*] Resuming from existing cache: {args.resume_from}")
+            print(f"[*] Restoring offline input: {args.resume_state or args.resume_from}")
         try:
-            notes = pipeline.load_from_jsonl(args.resume_from, allow_synthetic=args.allow_synthetic)
+            if args.resume_state:
+                response = pipeline.resume_task_snapshot(args.resume_state, allow_synthetic=args.allow_synthetic)
+            else:
+                response = pipeline.import_jsonl_task(args.resume_from, allow_synthetic=args.allow_synthetic)
+            notes = response.notes
+            crawl_success, is_partial = response.success, response.is_partial
+            crawl_errors = [redact_error(error) for error in response.errors]
             if args.format != "json":
                 print(f"[√] Loaded {len(notes)} cached notes successfully.")
         except Exception as e:
             if args.format == "json":
-                print(json.dumps({"error": f"Failed loading cache: {redact_error(e)}"}))
+                print(json.dumps({"success": False, "error": f"Failed restoring offline input: {redact_error(e)}"}))
             else:
                 print(f"[x] Failed loading cache: {redact_error(e)}")
             sys.exit(1)
@@ -126,6 +138,31 @@ async def main():
             print(f"[*] Starting crawl via driver '{args.driver}' (fallback: '{args.fallback_driver}')...")
             print(f"[*] Keywords: {keywords} | Limit: {args.limit} | Budget: {args.max_budget}")
 
+        def fail_capture(error, name, code):
+            result = {'success': False, 'error': name, 'message': redact_error(error)}
+            if args.snapshot_file:
+                try:
+                    manifest = pipeline.checkpoint_store.load_task_manifest(request.task_id)
+                    if manifest is None:
+                        raise RuntimeError('The failed task has no recoverable manifest')
+                    failed = CrawlResponse(False, manifest.driver_name, 0, [], errors=list(manifest.errors),
+                                           manifest=manifest, is_synthetic=manifest.is_synthetic,
+                                           data_source=manifest.data_source,
+                                           detail_success_count=manifest.detail_success_count,
+                                           detail_failed_count=manifest.detail_failed_count,
+                                           actual_request_count=manifest.actual_request_count)
+                    pipeline.save_task_snapshot(failed, args.snapshot_file)
+                    result['snapshot_path'] = args.snapshot_file
+                except Exception as snapshot_error:
+                    result['snapshot_error'] = redact_error(snapshot_error)
+            if args.format == 'json':
+                print(json.dumps(result, ensure_ascii=False))
+            else:
+                print(f"[x] {name}: {result['message']}")
+                if 'snapshot_error' in result:
+                    print(f"[!] Snapshot could not be saved: {result['snapshot_error']}")
+            sys.exit(code)
+
         try:
             response = await pipeline.execute_crawl(
                 request,
@@ -141,34 +178,18 @@ async def main():
                 if crawl_errors:
                     print(f"[!] Warnings: {'; '.join(crawl_errors)}")
         except BudgetExceededError as e:
-            if args.format == "json":
-                print(json.dumps({"error": "BudgetExceededError", "message": redact_error(e)}))
-            else:
-                print(f"[!] Budget exceeded: {redact_error(e)}")
-            sys.exit(1)
+            fail_capture(e, 'BudgetExceededError', 1)
         except CircuitBreakerOpenError as e:
-            if args.format == "json":
-                print(json.dumps({"error": "CircuitBreakerOpenError", "message": redact_error(e)}))
-            else:
-                print(f"[x] Circuit breaker open: {redact_error(e)}")
-            sys.exit(2)
+            fail_capture(e, 'CircuitBreakerOpenError', 2)
         except DriverError as e:
-            if args.format == "json":
-                print(json.dumps({"error": "DriverError", "message": redact_error(e)}))
-            else:
-                print(f"[x] Driver error: {redact_error(e)}")
-            sys.exit(2)
+            fail_capture(e, 'DriverError', 2)
         except Exception as e:
-            if args.format == "json":
-                print(json.dumps({"error": "UnexpectedError", "message": redact_error(e)}))
-            else:
-                print(f"[x] Pipeline unexpected error: {redact_error(e)}")
-            sys.exit(2)
+            fail_capture(e, 'UnexpectedError', 2)
     else:
         if args.format == "json":
-            print(json.dumps({"error": "Either --keywords or --resume-from is required"}))
+            print(json.dumps({"error": "One of --keywords, --resume-from or --resume-state is required"}))
         else:
-            print("[!] Error: Either --keywords or --resume-from is required.")
+            print("[!] Error: One of --keywords, --resume-from or --resume-state is required.")
         sys.exit(1)
 
     # 4. Optional Insight Analysis
@@ -176,10 +197,14 @@ async def main():
         for n in notes:
             ins = extract_insights_for_note(n)
             n.add_insight(ins)
+            n.stage_status = StageStatus.ANALYZED
         if args.format != "json":
             print(f"[√] Attached empirical insights to {len(notes)} notes.")
 
     # 5. Downstream Exports
+    if args.snapshot_file:
+        # Keep recoverable inputs even if a later export encounters a conflict.
+        pipeline.save_task_snapshot(response, args.snapshot_file)
     created_csv = ""
     created_cards = []
     if args.export_csv:
@@ -188,7 +213,7 @@ async def main():
             print(f"[√] Exported CSV to: {created_csv}")
 
     if args.export_obsidian:
-        export_task = response.manifest.task_id if not args.resume_from and getattr(response, "manifest", None) else "cache_export"
+        export_task = response.manifest.task_id if getattr(response, "manifest", None) else "cache_export"
         created_cards = pipeline.export_obsidian_cards(notes, args.export_obsidian, task_id=export_task)
         if args.format != "json":
             print(f"[√] Generated/Updated {len(created_cards)} idempotent Obsidian cards in: {args.export_obsidian}")
@@ -210,11 +235,15 @@ async def main():
             "success": overall_success,
             "total_notes": len(notes),
             "is_partial": is_partial,
-            "is_synthetic": any(note.is_synthetic for note in notes),
+            "is_synthetic": bool(getattr(response, 'is_synthetic', False) or any(note.is_synthetic for note in notes)),
             "data_sources": sorted({note.data_source for note in notes}),
             "errors": crawl_errors,
             "csv_path": created_csv,
             "obsidian_cards_count": len(created_cards),
+            "snapshot_path": args.snapshot_file,
+            "operation": getattr(getattr(response, 'manifest', None), 'operation', 'crawl'),
+            "task_id": getattr(getattr(response, 'manifest', None), 'task_id', None),
+            "parent_task_id": getattr(getattr(response, 'manifest', None), 'parent_task_id', None),
             "budget_stats": pipeline.budget_manager.get_stats()
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))

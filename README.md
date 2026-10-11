@@ -32,7 +32,7 @@ xhs-pipeline --settings config/settings.json --driver mediacrawler --keywords "�
 离线演示（不会采集平台）：
 
 ```bash
-xhs-pipeline --driver mock --allow-synthetic --keywords "演示" --limit 2 --state-file ./data/demo.json --export-obsidian ./obsidian_cards --format json
+xhs-pipeline --driver mock --allow-synthetic --keywords "演示" --limit 2 --analyze --snapshot-file ./data/task.json --export-obsidian ./obsidian_cards --format json
 ```
 
 从已有原始 JSONL 导出：
@@ -41,7 +41,15 @@ xhs-pipeline --driver mock --allow-synthetic --keywords "演示" --limit 2 --sta
 xhs-pipeline --resume-from ./data/search_contents.jsonl --export-obsidian ./obsidian_cards --format json
 ```
 
-`--state-file` 保存原子写入的扁平 JSON 快照，保留字段状态和数据来源；它不是包含全部洞察与发现轨迹的任务恢复格式。`--resume-from` 接受原始 JSONL。含模拟标记的缓存也必须显式允许模拟数据。
+从完整快照离线恢复（模拟快照仍需明确许可）：
+
+```bash
+xhs-pipeline --resume-state ./data/task.json --allow-synthetic --max-budget 0 --snapshot-file ./data/resumed.json --export-obsidian ./obsidian_cards --format json
+```
+
+`--snapshot-file` 保存完整任务快照，包括全部内容字段、指标状态、发现轨迹、洞察证据、原任务清单和恢复链。`--resume-state` 校验后恢复这些记录，不调用采集驱动。默认保留洞察；显式 `--analyze` 会追加一次分析。原任务失败或部分成功的状态继续体现在退出码中，离线导出成功不会将不完整采集改称完整成功。
+
+`--state-file` 继续保存原有扁平 JSON 列表，不用于完整任务恢复；`--resume-from` 继续接受原始 JSONL，无法补回原文件没有记录的洞察或研究上下文。三种输入方式互斥，含模拟标记的快照与缓存均需明确许可。详见 [快照格式与恢复语义](docs/task-snapshots.md)。
 
 ## 数据与恢复语义
 
