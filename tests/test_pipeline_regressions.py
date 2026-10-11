@@ -30,6 +30,7 @@ class StubDriver(BaseCrawlerDriver):
 def pipeline(tmp_path, **settings):
     config = tmp_path / "settings.json"
     config.write_text(json.dumps({"checkpoint_dir": str(tmp_path / "state"), "fallback_driver": None,
+                                  "require_runtime_control": False,
                                   "rate_limit_per_minute": 1000, "retry_attempts": 1, **settings}), encoding="utf-8")
     return XhsPipeline(str(config))
 

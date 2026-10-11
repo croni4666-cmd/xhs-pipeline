@@ -31,6 +31,15 @@ class BaseCrawlerDriver(ABC):
     is_synthetic = False
 
     @property
+    def runtime_capabilities(self):
+        from ..control import RuntimeCapabilities
+        return RuntimeCapabilities()
+
+    async def prepare_run(self, runtime):
+        """Optional injection hook; capable adapters bind runtime before any platform work."""
+        pass
+
+    @property
     def version(self):
         return "unknown"
 

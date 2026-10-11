@@ -47,6 +47,9 @@ async def main():
     parser.add_argument("--media", action="store_true", help="Enable media download in the external driver")
     inputs.add_argument("--resume-from", "-r", type=str, default="", help="Resume downstream processing from raw JSONL file")
     inputs.add_argument("--resume-state", type=str, default="", help="Recover a complete task snapshot offline")
+    inputs.add_argument('--control-status', action='store_true', help='Read local online-control state without platform access')
+    inputs.add_argument('--acknowledge-pause', action='store_true', help='Acknowledge local pause; next online task must verify its session again')
+    parser.add_argument('--control-scope', default=None, help='Nonsecret persistent session scope shared across crawler frameworks')
     parser.add_argument("--comments", action="store_true", help="Enable comment scraping")
     parser.add_argument("--analyze", action="store_true", help="Run empirical pattern and insight extraction")
     parser.add_argument("--export-csv", type=str, default="", help="Export CSV path")
@@ -59,11 +62,20 @@ async def main():
     args = parser.parse_args()
     if args.limit < 1 or args.max_budget < 0 or args.rate_limit < 1:
         parser.error("limit/rate-limit must be positive and max-budget nonnegative")
-    if args.health_check and (args.keywords or args.resume_from or args.resume_state):
+    if args.health_check and (args.keywords or args.resume_from or args.resume_state or args.control_status or args.acknowledge_pause):
         parser.error("health-check cannot be combined with a capture or recovery input")
     pipeline = XhsPipeline(args.settings) if args.settings else XhsPipeline()
     if args.allow_synthetic and hasattr(pipeline, "settings"):
         pipeline.settings["allow_synthetic"] = True
+    if args.control_scope is not None:
+        pipeline.settings['control_scope'] = args.control_scope
+    if args.control_status or args.acknowledge_pause:
+        runtime = pipeline.create_runtime(CrawlRequest([]))
+        if args.acknowledge_pause:
+            pipeline.control_store.acknowledge(runtime.scope)
+        report = runtime.report()
+        print(json.dumps({'success': True, 'control': report}, ensure_ascii=False) if args.format == 'json' else str(report))
+        return
 
     # Configure budget and rate limit from CLI args
     pipeline.budget_manager.max_budget = args.max_budget

@@ -64,6 +64,8 @@ class XhsPipeline:
         self.checkpoint_store = CheckpointStore(state_dir=state_dir)
         self.cleaner = DataCleaner()
         self.router: Optional[DriverFallbackRouter] = None
+        from .control import ControlStore
+        self.control_store = ControlStore(Path(state_dir) / 'runtime_control')
 
         self._register_default_drivers()
 
@@ -106,8 +108,26 @@ class XhsPipeline:
             raise PipelineError(f"Driver '{driver_name}' not found. Available: {list(self.drivers.keys())}")
         return driver
 
+    def create_runtime(self, request):
+        from .control import RuntimeContext, RequestPolicy
+        return RuntimeContext(self.control_store, self.settings.get('control_platform', 'xhs'),
+                              self.settings.get('control_scope', 'default'), request.task_id,
+                              RequestPolicy(self.settings.get('controlled_requests_per_task', 20),
+                                            self.settings.get('controlled_requests_per_minute', 6),
+                                            self.settings.get('controlled_requests_per_day', 100)))
+
     async def execute_crawl(self, request, driver_name=None, fallback_driver=None):
+        runtime = self.create_runtime(request) if self.settings.get('require_runtime_control', True) is True else None
+        leases = []
+        try:
+            return await self._execute_crawl(request, driver_name, fallback_driver, runtime, leases)
+        finally:
+            for lease in reversed(leases):
+                await lease.__aexit__(None, None, None)
+
+    async def _execute_crawl(self, request, driver_name=None, fallback_driver=None, runtime=None, leases=None):
         import asyncio
+        from .control import ControlPausedError, SessionState
         from . import __version__
         from .security import public_config, redact_error
         started = time.time()
@@ -130,6 +150,15 @@ class XhsPipeline:
             used_drivers[name] = driver
             if getattr(driver, "is_synthetic", False) and not allowed:
                 raise CapabilityUnsupportedError("Synthetic drivers require explicit allow_synthetic consent")
+            if runtime is not None and not driver.is_synthetic:
+                if not leases:
+                    lease = runtime.lease()
+                    await lease.__aenter__()
+                    leases.append(lease)
+                runtime.check_pause()
+                if not driver.runtime_capabilities.supported:
+                    raise CapabilityUnsupportedError('Live driver does not implement required runtime control hooks')
+                await driver.prepare_run(runtime)
             breaker = self.router.get_circuit_breaker(name)
             backoff = getattr(self, "backoff", ExponentialBackoff(max_retries=1))
 
@@ -141,6 +170,10 @@ class XhsPipeline:
                 attempts.append(record)
                 try:
                     result = await driver.crawl_keywords(request)
+                    if runtime is not None and not driver.is_synthetic:
+                        runtime.check_pause()
+                        if runtime.report()['state'] != 'ready':
+                            raise DriverError('Driver did not verify its session; success refused')
                     if not isinstance(result, CrawlResponse):
                         raise DriverError("Driver returned an invalid response")
                     if (result.is_synthetic or any(n.is_synthetic for n in result.notes)) and not allowed:
@@ -159,6 +192,8 @@ class XhsPipeline:
                     breaker.record_failure()
                     record["status"] = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
                     record["error"] = redact_error(str(exc) or type(exc).__name__)
+                    if runtime is not None and not driver.is_synthetic and isinstance(exc, (AuthenticationError, RateLimitError)):
+                        runtime.pause(SessionState.AUTH_REQUIRED if isinstance(exc, AuthenticationError) else SessionState.RATE_LIMITED)
                     raise
                 finally:
                     record["completed_at"] = time.time()
@@ -190,6 +225,8 @@ class XhsPipeline:
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
                 stop_reason = "cancelled"
+            elif isinstance(exc, ControlPausedError):
+                stop_reason = 'online_paused'
             elif isinstance(exc, BudgetExceededError):
                 stop_reason = "budget_exceeded"
             elif isinstance(exc, AuthenticationError):
@@ -220,6 +257,11 @@ class XhsPipeline:
             actual_count = sum(reported) if reported and all(type(v) is int and v >= 0 for v in reported) else None
             stats = {**self.budget_manager.get_stats(), "budget_unit": "driver_attempt",
                      "task_driver_attempts": len(attempts)}
+            if runtime is not None and leases:
+                try:
+                    stats['runtime_control'] = runtime.report()
+                except PipelineError:
+                    stats['runtime_control'] = {'state': 'unknown', 'error': 'control_state_invalid'}
             manifest = CrawlTaskManifest(
                 task_id=request.task_id, driver_name=active,
                 driver_version=getattr(used_drivers.get(active), "version", "unknown"),
