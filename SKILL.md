@@ -68,7 +68,7 @@ python scripts/run_pipeline.py `
 ```
 
 ### 4. 离线断点恢复 (零网络开销复用已有数据)
-恢复输入为原始 JSONL；依赖访问凭证的引用需重新搜索。模拟缓存必须通过统一 CLI 的 --allow-synthetic 显式许可。
+完整任务使用统一 CLI 的 --resume-state 恢复 --snapshot-file 生成的快照；原始 JSONL 使用 --resume-from。恢复保留已有洞察、原始状态与清单来源链，不触发采集驱动。依赖访问凭证的在线查询仍需重新搜索；模拟输入必须显式 --allow-synthetic。
 ```powershell
 python scripts/run_pipeline.py `
   --resume-from "./data/xhs/jsonl/search_contents.jsonl" `

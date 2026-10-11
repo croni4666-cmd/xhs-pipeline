@@ -25,7 +25,7 @@ def main():
         run(['--driver', 'mock', '--allow-synthetic', '--keywords', 'audit', '--max-budget', '0', '--format', 'json'], 1)
         result = run(['--driver', 'mock', '--allow-synthetic', '--keywords', 'audit', '--limit', '2',
                       '--export-obsidian', 'cards', '--export-csv', 'notes.csv',
-                      '--state-file', 'state.json', '--format', 'json'], 0)
+                      '--state-file', 'state.json', '--snapshot-file', 'task.json', '--analyze', '--format', 'json'], 0)
         assert result['success'] and result['total_notes'] == 2
         assert result['is_synthetic'] is True and result['data_sources'] == ['mock']
         assert result['budget_stats']['budget_unit'] == 'driver_attempt'
@@ -35,6 +35,17 @@ def main():
             rows = list(csv.DictReader(stream))
         assert len(rows) == 2 and all(row['media_presence'] for row in rows)
         assert len(list((cwd / 'data/checkpoints').glob('manifest_*.json'))) == 3
+        run(['--resume-state', 'task.json', '--format', 'json'], 1)
+        before = {card: (card.read_bytes(), card.stat().st_mtime_ns) for card in (cwd / 'cards').glob('*.md')}
+        restored = run(['--resume-state', 'task.json', '--allow-synthetic', '--max-budget', '0',
+                        '--export-obsidian', 'cards', '--snapshot-file', 'resumed.json', '--format', 'json'], 0)
+        assert restored['operation'] == 'offline_resume' and restored['budget_stats']['used_requests'] == 0
+        assert all(card.read_bytes() == data and card.stat().st_mtime_ns == stamp for card, (data, stamp) in before.items())
+        original = json.loads((cwd / 'task.json').read_text(encoding='utf-8'))['payload']
+        resumed = json.loads((cwd / 'resumed.json').read_text(encoding='utf-8'))['payload']
+        assert original['notes'] == resumed['notes']
+        assert resumed['lineage'][0]['task_id'] == original['manifest']['task_id']
+        assert resumed['manifest']['actual_request_count'] == 0
         subprocess.run([sys.executable, '-c', '''
 from pathlib import Path
 import core
@@ -57,7 +68,7 @@ pipe.export_obsidian_cards([note], 'idempotent', task_id='smoke')
 assert b'manual annotation' in path.read_bytes()
 assert list(path.parent.glob('*.bak'))
 '''], cwd=cwd, env=env, check=True, timeout=30)
-    print('Installed wheel smoke passed: defaults, gates, exits, manifest, CSV, state, annotations and idempotence')
+    print('Installed wheel smoke passed: defaults, gates, exits, manifest, CSV, snapshots, offline recovery, annotations and idempotence')
 
 
 if __name__ == '__main__':
