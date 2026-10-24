@@ -46,10 +46,16 @@ triggers:
 ### 1. 确保浏览器调试环境就绪 (若使用 CDP 驱动)
 本仓库不提供浏览器启动脚本。使用者应自行配置已授权的本地 CDP 浏览器与 MediaCrawler，并在本地 settings 中指定路径、解释器与端口。调试端口应仅在受控本地环境开放。
 
-### 2. 检查驱动健康状态
+### 2. 检查驱动健康状态与在线运行控制状态
 ```powershell
 # 检查默认 CDP 驱动
 python scripts/run_pipeline.py --driver mediacrawler --health-check
+
+# 查看本地会话范围暂停与受控请求配额状态（不发起网络请求）
+python scripts/run_pipeline.py --control-status --format json
+
+# 人工排查风险后解除本地暂停（保留 24h 请求账本，下次任务重新探测会话）
+python scripts/run_pipeline.py --acknowledge-pause --format json
 
 # 检查 HTTP 模拟驱动的本地初始化（不证明真实平台可达）
 python scripts/run_pipeline.py --driver http --health-check
@@ -98,6 +104,8 @@ python scripts/analyze_insights.py `
 | [`core/normalizer.py`](core/normalizer.py) | 数据清洗组件 `DataCleaner`（多词轨迹合并去重、正文完整性校验） |
 | [`core/storage.py`](core/storage.py) | 持久化导出组件 `ObsidianExporter`（原子写入、保护用户批注）与 `CsvExporter` |
 | [`core/checkpoint.py`](core/checkpoint.py) | 状态对账组件 `CheckpointStore`（崩溃指纹对账、跨进程引用持久化） |
+| [`core/snapshot.py`](core/snapshot.py) | 完整任务快照 `xhs_task_snapshot_v1`（离线恢复、结构校验与来源链追踪） |
+| [`core/control/`](core/control/) | 采集框架无关的持久运行控制（会话探测门禁、滚动时间窗配额、跨进程风险暂停与租约锁） |
 | [`core/resilience.py`](core/resilience.py) | 请求配额预算、指数退避重试、断路器熔断与驱动故障转移路由 |
 | [`core/pipeline.py`](core/pipeline.py) | 核心调度管线（纯净流程协调器，基于依赖注入） |
 | [`tests/test_conformance.py`](tests/test_conformance.py) | 通用驱动一致性合规测试套件（验证引用失效与取消语义） |

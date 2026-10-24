@@ -61,6 +61,39 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         )
         self.cdp_port = self.cfg.get("cdp_port", 9222)
         self._current_subprocess: Optional[asyncio.subprocess.Process] = None
+        self._runtime = None
+
+    @property
+    def runtime_capabilities(self):
+        from ..control import RuntimeCapabilities
+        return RuntimeCapabilities(True, True, True)
+
+    async def prepare_run(self, runtime):
+        self._runtime = runtime
+
+    def _observe_control_line(self, line, channel):
+        from ..control import SessionState
+        if line.startswith('XHS_CONTROL_EVENT '):
+            try:
+                event = json.loads(line[len('XHS_CONTROL_EVENT '):])
+                if event.get('schema') != 'runtime_event_v1': raise ValueError()
+                if set(event) == {'schema', 'state'}:
+                    state = SessionState(event['state'])
+                    if state in (SessionState.AUTH_REQUIRED, SessionState.CHALLENGE, SessionState.RATE_LIMITED, SessionState.ACCESS_RESTRICTED):
+                        self._runtime.pause(state)
+                    self._runtime.observe(state)
+                elif event == {'schema': 'runtime_event_v1', 'stop': 'budget_exceeded'}:
+                    from ..contracts import BudgetExceededError
+                    raise BudgetExceededError('Controlled request budget exhausted')
+                else: raise ValueError()
+            except (ValueError, TypeError, AttributeError):
+                raise DriverError('Malformed runtime control event') from None
+        elif re.search(r'(?i)(?:^|\]\s*)(?:Access restricted|XHS request blocked|CAPTCHA appeared|XHS account security restriction)', line):
+            if re.search(r'(?i)captcha|461|471', line): state = SessionState.CHALLENGE
+            elif '429' in line: state = SessionState.RATE_LIMITED
+            elif '401' in line: state = SessionState.AUTH_REQUIRED
+            else: state = SessionState.ACCESS_RESTRICTED
+            self._runtime.pause(state)
 
     @property
     def name(self) -> str:
@@ -120,6 +153,8 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                   "ENABLE_CDP_MODE": True, "CDP_CONNECT_EXISTING": True,
                   "AUTO_CLOSE_BROWSER": False, "SORT_TYPE": sort_type,
                   "PLATFORM": "xhs", "CRAWLER_TYPE": "search", "SAVE_DATA_OPTION": "jsonl"}
+        if self._runtime is not None:
+            values.update(MAX_CONCURRENCY_NUM=1, SAVE_LOGIN_STATE=True)
         source = self._rewrite_assignments(content, values)
         platform_file = os.path.join(self.mediacrawler_path, "config", "xhs_config.py")
         platform_source = None
@@ -216,6 +251,9 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
     async def crawl_keywords(self, request):
         from ..persistence import async_file_lock
         from ..normalizer import normalize_raw_note
+        if self._runtime is None and self.cfg.get('require_runtime_control', True) is not False:
+            from ..contracts import CapabilityUnsupportedError
+            raise CapabilityUnsupportedError('Live MediaCrawler requires a runtime control context')
         if not await self.health_check():
             return CrawlResponse(False, self.name, 0, [], errors=["Local CDP endpoint is unavailable"])
         async with async_file_lock(Path(self.mediacrawler_path) / ".xhs-pipeline.lock"):
@@ -228,12 +266,31 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                     before[str(file)] = (len(data), hashlib.sha256(data).hexdigest())
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
+            arguments = ['main.py']
+            input_payload = None
+            if self._runtime is not None:
+                expected = self.cfg.get('expected_mediacrawler_revision')
+                if expected and self.version != expected:
+                    raise DriverError('MediaCrawler revision does not match the configured pin')
+                arguments = ['-m', 'core.drivers.mediacrawler_runtime']
+                package_root = str(Path(__file__).resolve().parents[2])
+                env['PYTHONPATH'] = package_root + os.pathsep + env.get('PYTHONPATH', '')
+                payload = {'runtime': self._runtime.bridge_config(), 'note_limit': request.max_count_per_keyword}
+                input_payload = (json.dumps(payload, ensure_ascii=False) + '\n').encode('utf-8')
             process = await asyncio.create_subprocess_exec(
-                self.python_path, "main.py", cwd=self.mediacrawler_path,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+                self.python_path, *arguments, cwd=self.mediacrawler_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE if input_payload is not None else None, env=env)
             self._current_subprocess = process
             try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=float(self.cfg.get("crawl_timeout_seconds", 300)))
+                timeout = float(self.cfg.get('crawl_timeout_seconds', 300))
+                if self._runtime is not None:
+                    from .process_monitor import monitor_process
+                    stdout, stderr = await monitor_process(process, self._observe_control_line, self._terminate, timeout, input_payload)
+                    if self._runtime.report()['state'] != 'ready':
+                        raise DriverError('MediaCrawler did not confirm a valid existing session')
+                else:
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
             except asyncio.CancelledError:
                 await self._terminate(process)
                 raise

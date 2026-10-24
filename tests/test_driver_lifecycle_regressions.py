@@ -13,7 +13,7 @@ def fixture(tmp_path):
     (tmp_path / "config" / "base_config.py").write_text('KEYWORDS="old"\n', encoding="utf-8")
     data = tmp_path / "data" / "xhs" / "jsonl"
     data.mkdir(parents=True)
-    driver = MediaCrawlerDriver({"mediacrawler_path": str(tmp_path)})
+    driver = MediaCrawlerDriver({"mediacrawler_path": str(tmp_path), "require_runtime_control": False})
     async def ready(): return True
     driver.health_check = ready
     return driver, data

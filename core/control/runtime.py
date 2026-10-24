@@ -28,21 +28,25 @@ class RuntimeContext:
         self.store.observe(self.scope, SessionState.READY)
         self._verified = True
 
+    @property
+    def session_verified(self):
+        return self._verified and self.store.read(self.scope)['state'] == 'ready'
+
     def observe(self, state):
         state = SessionState(state)
-        self.store.observe(self.scope, state)
         self._verified = state == SessionState.READY
+        self.store.observe(self.scope, state)
 
     def pause(self, state):
         state = SessionState(state)
         if state not in PAUSE_STATES: raise ValueError('This state is not a risk pause')
-        self.store.observe(self.scope, state)
         self._verified = False
+        self.store.observe(self.scope, state)
         raise ControlPausedError(state)
 
     async def before_request(self, *, probe=False):
         self.check_pause()
-        if not self._verified and probe is not True:
+        if not self.session_verified and probe is not True:
             raise DriverError('Session has not been verified; normal request refused')
         while True:
             delay = self.store.reserve(self.scope, self.task_id, self.policy)

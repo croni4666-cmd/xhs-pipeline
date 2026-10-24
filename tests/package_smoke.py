@@ -22,6 +22,10 @@ def main():
             return json.loads(result.stdout)
         denied = run(['--driver', 'mock', '--keywords', 'audit', '--format', 'json'], 2)
         assert 'error' in denied
+        control = run(['--control-status', '--format', 'json'], 0)
+        assert control['success'] and control['control']['state'] == 'unknown' and not control['control']['paused']
+        acknowledged = run(['--acknowledge-pause', '--format', 'json'], 0)
+        assert acknowledged['success'] and acknowledged['control']['state'] == 'unknown'
         run(['--driver', 'mock', '--allow-synthetic', '--keywords', 'audit', '--max-budget', '0', '--format', 'json'], 1)
         result = run(['--driver', 'mock', '--allow-synthetic', '--keywords', 'audit', '--limit', '2',
                       '--export-obsidian', 'cards', '--export-csv', 'notes.csv',
@@ -56,6 +60,7 @@ assert 'site-packages' in str(Path(core.__file__)), core.__file__
 pipe = XhsPipeline()
 assert pipe.settings['fallback_driver'] is None
 assert pipe.settings['allow_synthetic'] is False
+assert pipe.settings['require_runtime_control'] is True
 note = UnifiedNote('id', desc='body')
 path = Path(pipe.export_obsidian_cards([note], 'idempotent', task_id='smoke')[0])
 original = path.read_bytes()

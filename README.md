@@ -47,9 +47,16 @@ xhs-pipeline --resume-from ./data/search_contents.jsonl --export-obsidian ./obsi
 xhs-pipeline --resume-state ./data/task.json --allow-synthetic --max-budget 0 --snapshot-file ./data/resumed.json --export-obsidian ./obsidian_cards --format json
 ```
 
+查看或人工解除本地在线采集风险暂停（不触发网络请求，保留 24 小时请求配额记录）：
+
+```bash
+xhs-pipeline --settings config/settings.json --control-status --format json
+xhs-pipeline --settings config/settings.json --acknowledge-pause --format json
+```
+
 `--snapshot-file` 保存完整任务快照，包括全部内容字段、指标状态、发现轨迹、洞察证据、原任务清单和恢复链。`--resume-state` 校验后恢复这些记录，不调用采集驱动。默认保留洞察；显式 `--analyze` 会追加一次分析。原任务失败或部分成功的状态继续体现在退出码中，离线导出成功不会将不完整采集改称完整成功。
 
-`--state-file` 继续保存原有扁平 JSON 列表，不用于完整任务恢复；`--resume-from` 继续接受原始 JSONL，无法补回原文件没有记录的洞察或研究上下文。三种输入方式互斥，含模拟标记的快照与缓存均需明确许可。详见 [快照格式与恢复语义](docs/task-snapshots.md)。
+`--state-file` 继续保存原有扁平 JSON 列表，不用于完整任务恢复；`--resume-from` 继续接受原始 JSONL，无法补回原文件没有记录的洞察或研究上下文。输入与本地控制命令互斥，含模拟标记的快照与缓存均需明确许可。详见 [快照格式与恢复语义](docs/task-snapshots.md) 与 [运行控制设计](docs/runtime-control-design.md)。
 
 ## 数据与恢复语义
 
@@ -57,7 +64,7 @@ xhs-pipeline --resume-state ./data/task.json --allow-synthetic --max-budget 0 --
 - `ContentFact` / `UnifiedNote` 与凭证分离，`DiscoveryRecord` 保存各次发现的关键词、排名和时间。
 - 正文、媒体和指标保留五种 `FieldPresence`。未知正文完整性为 `unknown`，未采集不等同于空内容或零互动。
 - 任务清单记录有效配置指纹、驱动版本、尝试、去重、停止原因和内容哈希。外部子进程内部请求数未受监测时为 `null`。
-- `--max-budget` 与 `--rate-limit` 的单位是**驱动调用尝试**，包含重试；不是 MediaCrawler 内部 HTTP 请求数。
+- `--max-budget` 与 `--rate-limit` 的单位是**驱动调用尝试**，包含重试；在线驱动同时受 `core/control` 会话范围配额（每任务/每分钟/滚动 24 小时受控操作）、会话有效探测门禁及风险信号跨进程持久暂停约束。遇到登录失效、验证码、429 限流或账号限制时立即暂停该会话范围，不自动重登或切换备用驱动，需人工排查后执行 `--acknowledge-pause`。
 - 卡片使用固定身份文件名、生成区与人工批注区。相同生成输入不重写；更新前保留旧文件备份。身份冲突、读取失败或边界歧义会阻断覆盖。
 - 对账分别验证事实哈希、完整渲染输入和磁盘实际字节哈希；不能仅凭卡片头中的哈希认定导出成功。
 

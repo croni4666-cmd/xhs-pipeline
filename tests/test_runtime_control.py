@@ -90,3 +90,12 @@ def test_scope_lease_serializes_tasks_until_cleanup(tmp_path):
         await asyncio.wait_for(task, 2)
         assert order == ['second']
     asyncio.run(run())
+
+
+def test_external_acknowledgment_invalidates_old_ready_context(tmp_path):
+    Store, Runtime, Policy, State = components()
+    store = Store(tmp_path)
+    old = Runtime(store, 'p', 's', 'task', Policy())
+    old.mark_ready()
+    store.acknowledge(old.scope)
+    with pytest.raises(PipelineError): asyncio.run(old.before_request())
