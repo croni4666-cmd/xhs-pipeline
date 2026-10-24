@@ -34,8 +34,9 @@ flowchart TD
         CLI["CLI 命令行 (run_pipeline.py)\n[支持 --format json 与标准退出码]"]
     end
 
-    subgraph Governance["2. 弹性治理与风控层 (Resilience Layer)"]
-        BudgetManager["请求预算配额 (RequestBudgetManager)"]
+    subgraph Governance["2. 弹性治理与风控层 (Resilience & Runtime Control Layer)"]
+        BudgetManager["驱动尝试配额 (RequestBudgetManager)"]
+        RuntimeControl["持久会话控制与请求账本 (ControlStore / RuntimeContext)"]
         Backoff["指数退避重试 (ExponentialBackoff)"]
         Breaker["断路器状态机 (CircuitBreaker)"]
         FallbackRouter["驱动故障转移路由 (DriverFallbackRouter)"]
@@ -45,6 +46,7 @@ flowchart TD
         Pipeline["XhsPipeline 调度协调器"]
         Cleaner["数据清洗去重 (DataCleaner)"]
         Checkpoint["检查点与崩溃对账 (CheckpointStore)"]
+        Snapshot["全量任务快照与来源链 (snapshot.py)"]
         Exporter["原子卡片导出 (ObsidianExporter / CsvExporter)"]
         Contracts["领域模型:\n- ContentFact (纯净内容事实)\n- NoteReference (驱动私有访问上下文)\n- DiscoveryRecord (多维发现轨迹)\n- FieldPresence (显式数据状态)\n- CrawlTaskManifest (检索复现清单)"]
     end

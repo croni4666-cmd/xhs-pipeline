@@ -223,6 +223,13 @@ class XhsPipeline:
             stop_reason = "failed" if not response.success else "partial_success" if response.is_partial else "completed"
             return response
         except BaseException as exc:
+            partial = getattr(exc, "partial_response", None)
+            if isinstance(partial, CrawlResponse):
+                raw_count = len(partial.notes)
+                partial.notes = self.cleaner.deduplicate_notes(partial.notes)
+                partial.total_notes = len(partial.notes)
+                partial.is_partial = bool(partial.notes)
+                response = partial
             if isinstance(exc, asyncio.CancelledError):
                 stop_reason = "cancelled"
             elif isinstance(exc, ControlPausedError):

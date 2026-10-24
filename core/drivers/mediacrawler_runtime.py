@@ -144,13 +144,19 @@ class MediaCrawlerGuards:
             return response
 
         async def search(client, *args, **kwargs):
-            result = await original_search(client, *args, **kwargs)
             keyword = kwargs.get('keyword', args[0] if args else '')
+            if guard.seen.get(keyword, 0) >= guard.note_limit:
+                return {'items': [], 'has_more': False}
+            result = await original_search(client, *args, **kwargs)
             if isinstance(result, dict) and isinstance(result.get('items'), list):
                 remaining = max(0, guard.note_limit - guard.seen.get(keyword, 0))
                 selected = [item for item in result['items'] if isinstance(item, dict) and item.get('model_type') not in ('rec_query', 'hot_query')][:remaining]
                 guard.seen[keyword] = guard.seen.get(keyword, 0) + len(selected)
-                return {**result, 'items': selected}
+                return {
+                    **result,
+                    'items': selected,
+                    'has_more': bool(result.get('has_more')) and guard.seen[keyword] < guard.note_limit,
+                }
             return result
 
         try:

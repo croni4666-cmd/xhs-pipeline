@@ -178,3 +178,35 @@ def test_guarded_subprocess_end_to_end_with_fake_provider(tmp_path):
     asyncio.run(run())
     report = runtime.report()
     assert report['state'] == 'ready' and not report['paused'] and report['controlled_attempts'] == 2
+
+
+def test_midrun_risk_pause_preserves_partial_captured_notes(tmp_path, monkeypatch):
+    driver, runtime = controlled(tmp_path)
+    out_dir = tmp_path / 'mc' / 'data' / 'xhs' / 'jsonl'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    class PartialRiskProcess:
+        returncode = 0
+        stdin = None
+        def __init__(self):
+            (out_dir / 'search_contents_partial.jsonl').write_text(
+                '{"note_id":"n_partial","title":"Saved","desc":"Body","source_keyword":"audit"}\n',
+                encoding='utf-8'
+            )
+            self.stdout, self.stderr = asyncio.StreamReader(), asyncio.StreamReader()
+            self.stdout.feed_data(
+                b'XHS_CONTROL_EVENT {"schema": "runtime_event_v1", "state": "ready"}\n'
+                b'Access restricted: HTTP 429\n'
+            )
+            self.stdout.feed_eof(); self.stderr.feed_eof()
+        async def wait(self): return 0
+    async def spawn(*args, **kwargs): return PartialRiskProcess()
+    monkeypatch.setattr('core.drivers.mediacrawler.asyncio.create_subprocess_exec', spawn)
+    async def run():
+        await driver.prepare_run(runtime)
+        with pytest.raises(PipelineError) as exc_info:
+            await driver.crawl_keywords(CrawlRequest(['audit']))
+        partial = getattr(exc_info.value, 'partial_response', None)
+        assert partial is not None and not partial.success and partial.is_partial
+        assert [n.note_id for n in partial.notes] == ['n_partial']
+    asyncio.run(run())
+    assert runtime.report()['state'] == 'rate_limited' and runtime.report()['paused']

@@ -157,7 +157,10 @@ async def main():
                     manifest = pipeline.checkpoint_store.load_task_manifest(request.task_id)
                     if manifest is None:
                         raise RuntimeError('The failed task has no recoverable manifest')
-                    failed = CrawlResponse(False, manifest.driver_name, 0, [], errors=list(manifest.errors),
+                    partial = getattr(error, 'partial_response', None)
+                    partial_notes = list(partial.notes) if isinstance(partial, CrawlResponse) else []
+                    failed = CrawlResponse(False, manifest.driver_name, len(partial_notes), partial_notes,
+                                           errors=list(manifest.errors), is_partial=bool(partial_notes),
                                            manifest=manifest, is_synthetic=manifest.is_synthetic,
                                            data_source=manifest.data_source,
                                            detail_success_count=manifest.detail_success_count,

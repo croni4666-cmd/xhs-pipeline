@@ -75,3 +75,27 @@ def test_simulation_does_not_consult_online_pause(tmp_path):
     with pytest.raises(PipelineError): runtime.pause(SessionState.AUTH_REQUIRED)
     response = asyncio.run(pipe.execute_crawl(CrawlRequest(['demo'], allow_synthetic=True), 'mock'))
     assert response.success and response.is_synthetic
+
+
+def test_partial_notes_on_midrun_pause_are_recorded_in_manifest(tmp_path):
+    from core.contracts import UnifiedNote
+    class PartialPauseDriver(ControlledDriver):
+        async def crawl_keywords(self, request):
+            self.calls += 1
+            await self.runtime.before_request()
+            try:
+                self.runtime.pause(SessionState.RATE_LIMITED)
+            except PipelineError as exc:
+                note = UnifiedNote('partial_1', title='T', desc='B', data_source='mediacrawler')
+                exc.partial_response = CrawlResponse(False, self.name, 1, [note], is_partial=True, data_source='mediacrawler')
+                raise
+    pipe = pipeline(tmp_path)
+    driver = PartialPauseDriver('partial_mc')
+    pipe.register_driver(driver)
+    request = CrawlRequest(['audit'])
+    with pytest.raises(PipelineError) as exc_info:
+        asyncio.run(pipe.execute_crawl(request, 'partial_mc'))
+    manifest = pipe.checkpoint_store.load_task_manifest(request.task_id)
+    assert manifest.stop_reason == 'online_paused'
+    assert manifest.deduplicated_count == 1 and 'partial_1' in manifest.content_hashes
+    assert exc_info.value.partial_response.manifest.task_id == request.task_id

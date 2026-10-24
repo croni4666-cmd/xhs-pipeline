@@ -248,9 +248,42 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                 pass
             await process.wait()
 
+    def _collect_new_records(self, data_dir: Path, before: Dict[str, Any], request: CrawlRequest):
+        from ..normalizer import normalize_raw_note
+        notes, references, errors, output_files = [], [], [], {}
+        for file in sorted(data_dir.glob("search_contents_*.jsonl")):
+            if not file.is_file() or file.is_symlink():
+                continue
+            data = file.read_bytes()
+            snapshot = before.get(str(file))
+            if snapshot and hashlib.sha256(data).hexdigest() == snapshot[1]:
+                continue
+            if snapshot and len(data) >= snapshot[0] and hashlib.sha256(data[:snapshot[0]]).hexdigest() == snapshot[1]:
+                data = data[snapshot[0]:]
+            if not data.strip():
+                continue
+            output_files["jsonl" if not output_files else f"jsonl_{len(output_files)}"] = str(file)
+            for index, line in enumerate(data.decode("utf-8").splitlines(), 1):
+                if not line.strip():
+                    continue
+                try:
+                    raw = json.loads(line)
+                    keyword = raw.get("source_keyword")
+                    if request.keywords and keyword not in request.keywords:
+                        continue
+                    note = normalize_raw_note(raw, keyword=keyword, rank=raw.get("rank"), data_source="mediacrawler")
+                    notes.append(note)
+                    references.append(NoteReference(
+                        note_id=note.note_id, driver_name=self.name, title_hint=note.title,
+                        author_hint=note.author_name, access_token=str(raw.get("xsec_token") or ""),
+                        discovered_keyword=keyword or "", rank=raw.get("rank"), can_resume_cross_process=False))
+                except (ValueError, TypeError, AttributeError):
+                    errors.append(f"Malformed output record {index}")
+        return notes, references, errors, output_files
+
     async def crawl_keywords(self, request):
         from ..persistence import async_file_lock
-        from ..normalizer import normalize_raw_note
+        from ..contracts import PipelineError
         if self._runtime is None and self.cfg.get('require_runtime_control', True) is not False:
             from ..contracts import CapabilityUnsupportedError
             raise CapabilityUnsupportedError('Live MediaCrawler requires a runtime control context')
@@ -296,41 +329,31 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                 raise
             except asyncio.TimeoutError as exc:
                 await self._terminate(process)
-                raise DriverError("Crawler operation timed out") from exc
+                err = DriverError("Crawler operation timed out")
+                notes, references, errors, output_files = self._collect_new_records(data_dir, before, request)
+                if notes or errors:
+                    err.partial_response = CrawlResponse(
+                        False, self.name, len(notes), notes, references=references,
+                        errors=errors, output_files=output_files,
+                        is_partial=bool(notes), data_source="mediacrawler")
+                raise err from exc
+            except PipelineError as exc:
+                notes, references, errors, output_files = self._collect_new_records(data_dir, before, request)
+                if notes or errors:
+                    exc.partial_response = CrawlResponse(
+                        False, self.name, len(notes), notes, references=references,
+                        errors=errors, output_files=output_files,
+                        is_partial=bool(notes), data_source="mediacrawler")
+                raise
             finally:
                 self._current_subprocess = None
+            notes, references, errors, output_files = self._collect_new_records(data_dir, before, request)
             if process.returncode != 0:
                 error = self._sanitize_error_msg(stderr.decode("utf-8", errors="replace"))
-                return CrawlResponse(False, self.name, 0, [], errors=[f"Crawler failed: {error[:300]}"])
-            notes, references, errors, output_files = [], [], [], {}
-            for file in sorted(data_dir.glob("search_contents_*.jsonl")):
-                if not file.is_file() or file.is_symlink():
-                    continue
-                data = file.read_bytes()
-                snapshot = before.get(str(file))
-                if snapshot and hashlib.sha256(data).hexdigest() == snapshot[1]:
-                    continue
-                if snapshot and len(data) >= snapshot[0] and hashlib.sha256(data[:snapshot[0]]).hexdigest() == snapshot[1]:
-                    data = data[snapshot[0]:]
-                if not data.strip():
-                    continue
-                output_files["jsonl" if not output_files else f"jsonl_{len(output_files)}"] = str(file)
-                for index, line in enumerate(data.decode("utf-8").splitlines(), 1):
-                    if not line.strip():
-                        continue
-                    try:
-                        raw = json.loads(line)
-                        keyword = raw.get("source_keyword")
-                        if request.keywords and keyword not in request.keywords:
-                            continue
-                        note = normalize_raw_note(raw, keyword=keyword, rank=raw.get("rank"), data_source="mediacrawler")
-                        notes.append(note)
-                        references.append(NoteReference(
-                            note_id=note.note_id, driver_name=self.name, title_hint=note.title,
-                            author_hint=note.author_name, access_token=str(raw.get("xsec_token") or ""),
-                            discovered_keyword=keyword or "", rank=raw.get("rank"), can_resume_cross_process=False))
-                    except (ValueError, TypeError, AttributeError):
-                        errors.append(f"Malformed output record {index}")
+                return CrawlResponse(
+                    False, self.name, len(notes), notes, references=references,
+                    errors=[f"Crawler failed: {error[:300]}"] + errors, output_files=output_files,
+                    is_partial=bool(notes), data_source="mediacrawler")
             return CrawlResponse(
                 success=bool(notes) or not errors, driver_name=self.name, total_notes=len(notes),
                 notes=notes, references=references, errors=errors, output_files=output_files,
