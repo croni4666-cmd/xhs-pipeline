@@ -112,6 +112,31 @@ def test_actual_requested_note_count_is_respected_before_detail_fetch(tmp_path):
     finally: guard.restore()
 
 
+@pytest.mark.parametrize('has_more', [True, False])
+def test_quota_page_is_delivered_before_upstream_checks_next_page(tmp_path, has_more):
+    from core.drivers.mediacrawler_runtime import install_guards
+    bundle = bindings(); ctx = runtime(tmp_path)
+    provider_calls = []
+    async def provider(self, keyword):
+        provider_calls.append(keyword)
+        return {'items': [{'id': '1'}, {'id': '2'}], 'has_more': has_more}
+    bundle.client.get_note_by_keyword = provider
+    guard = install_guards(ctx, bundle, lambda _: None, 1)
+    async def run():
+        client = bundle.client()
+        assert await client.pong()
+        processed = []
+        # The pinned upstream checks has_more before processing this page's items.
+        for _ in range(3):
+            page = await client.get_note_by_keyword('audit')
+            if not page or not page.get('has_more', False): break
+            processed.extend(item['id'] for item in page['items'])
+        assert processed == ['1']
+        assert provider_calls == ['audit']
+    try: asyncio.run(run())
+    finally: guard.restore()
+
+
 def test_json_risk_code_and_browser_navigation_challenge_pause_session(tmp_path):
     from core.drivers.mediacrawler_runtime import install_guards, BridgeStop
     bundle = bindings(); ctx = runtime(tmp_path)

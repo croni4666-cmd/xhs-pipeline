@@ -77,6 +77,48 @@ def test_simulation_does_not_consult_online_pause(tmp_path):
     assert response.success and response.is_synthetic
 
 
+def test_previous_ready_does_not_authorize_a_new_driver_without_a_probe(tmp_path):
+    pipe = pipeline(tmp_path)
+    old = ControlledDriver('old_framework')
+    pipe.register_driver(old)
+    assert asyncio.run(pipe.execute_crawl(CrawlRequest(['audit']), old.name)).success
+    class SilentDriver(ControlledDriver):
+        async def prepare_run(self, runtime): self.runtime = runtime
+        async def crawl_keywords(self, request):
+            self.calls += 1
+            return CrawlResponse(True, self.name, 0, [])
+    restarted = pipeline(tmp_path)
+    unverified = SilentDriver('another_framework')
+    restarted.register_driver(unverified)
+    with pytest.raises(PipelineError, match='verify|verified'):
+        asyncio.run(restarted.execute_crawl(CrawlRequest(['audit']), unverified.name))
+
+
+@pytest.mark.parametrize('value', [None, 'true', 'false', 1, 0, [], {}])
+def test_only_explicit_boolean_false_can_disable_runtime_control(tmp_path, value):
+    from test_pipeline_regressions import StubDriver
+    pipe = pipeline(tmp_path)
+    pipe.settings['require_runtime_control'] = value
+    driver = StubDriver()
+    pipe.register_driver(driver)
+    with pytest.raises(PipelineError):
+        asyncio.run(pipe.execute_crawl(CrawlRequest(['audit']), driver.name))
+    assert driver.calls == 0
+
+
+def test_preparation_auth_failure_is_terminal_before_fallback(tmp_path):
+    from core.contracts import AuthenticationError
+    class Expired(ControlledDriver):
+        async def prepare_run(self, runtime): raise AuthenticationError('session expired')
+    pipe = pipeline(tmp_path)
+    first, backup = Expired(), ControlledDriver('backup')
+    pipe.register_driver(first); pipe.register_driver(backup)
+    with pytest.raises(PipelineError):
+        asyncio.run(pipe.execute_crawl(CrawlRequest(['audit']), first.name, backup.name))
+    assert backup.calls == 0
+    assert pipe.create_runtime(CrawlRequest([])).report()['paused']
+
+
 def test_partial_notes_on_midrun_pause_are_recorded_in_manifest(tmp_path):
     from core.contracts import UnifiedNote
     class PartialPauseDriver(ControlledDriver):

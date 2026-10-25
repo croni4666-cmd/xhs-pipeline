@@ -56,7 +56,7 @@ xhs-pipeline --settings config/settings.json --acknowledge-pause --format json
 
 `--snapshot-file` 保存完整任务快照，包括全部内容字段、指标状态、发现轨迹、洞察证据、原任务清单和恢复链。`--resume-state` 校验后恢复这些记录，不调用采集驱动。默认保留洞察；显式 `--analyze` 会追加一次分析。原任务失败或部分成功的状态继续体现在退出码中，离线导出成功不会将不完整采集改称完整成功。
 
-`--state-file` 继续保存原有扁平 JSON 列表，不用于完整任务恢复；`--resume-from` 继续接受原始 JSONL，无法补回原文件没有记录的洞察或研究上下文。输入与本地控制命令互斥，含模拟标记的快照与缓存均需明确许可。详见 [快照格式与恢复语义](docs/task-snapshots.md) 与 [运行控制设计](docs/runtime-control-design.md)。
+`--state-file` 继续保存原有扁平 JSON 列表，不用于完整任务恢复；`--resume-from` 继续接受原始 JSONL，无法补回原文件没有记录的洞察或研究上下文。输入与本地控制命令互斥，含模拟标记的快照与缓存均需明确许可。详见 [快照格式与恢复语义](docs/task-snapshots.md)、[运行控制使用与驱动接入](docs/runtime-control-guide.md) 与 [运行控制设计](docs/runtime-control-design.md)。
 
 ## 数据与恢复语义
 

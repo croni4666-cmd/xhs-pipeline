@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+- 运行控制复核修复：新调用必须完成本次会话验证；准备阶段认证失败和限速等待时的状态变化均阻断普通请求；控制开关严格要求布尔类型。
+- 保留达到上限的当前页，后续分页本地终止；中途停止时逐行严格解码 JSONL，保留截断行之前的完整事实。
+
 - 新增独立持久运行控制层（`core/control`）与受控 MediaCrawler 桥接（`core/drivers/mediacrawler_runtime.py`、`core/drivers/process_monitor.py`）：支持跨进程会话租约、有效会话探测门禁、网络错误与登录失效语义区分、每任务/每分钟/滚动 24 小时受控请求配额、子进程实时风险信号拦截（401/403/429/461/471/300011/300012 及风控日志）、只关闭当前任务新建页面，以及 CLI `--control-status`、`--acknowledge-pause`、`--control-scope`。详见 `docs/runtime-control-design.md`。
 - 新增完整任务快照 `xhs_task_snapshot_v1`、`--snapshot-file` 与 `--resume-state`，保留字段状态、发现轨迹、洞察和原清单；离线恢复不调用驱动，并记录父任务与来源快照指纹。
 - 快照采用严格结构/类型/内容校验、大小限制和原子写入；继续要求模拟数据许可，保留失败/部分成功状态以及人工批注。原有 `--state-file` 扁平格式和 JSONL 导入保持兼容。

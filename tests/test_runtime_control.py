@@ -99,3 +99,21 @@ def test_external_acknowledgment_invalidates_old_ready_context(tmp_path):
     old.mark_ready()
     store.acknowledge(old.scope)
     with pytest.raises(PipelineError): asyncio.run(old.before_request())
+
+
+def test_waiting_for_rate_slot_rechecks_session_after_acknowledgment(tmp_path, monkeypatch):
+    Store, Runtime, Policy, State = components()
+    clock = {'now': 100.0}
+    monkeypatch.setattr('core.control.store.time.time', lambda: clock['now'])
+    store = Store(tmp_path)
+    runtime = Runtime(store, 'p', 's', 'task', Policy(per_minute=1))
+    runtime.mark_ready()
+    async def run():
+        await runtime.before_request()
+        async def acknowledge(_):
+            store.acknowledge(runtime.scope)
+            clock['now'] += 61
+        monkeypatch.setattr('core.control.runtime.asyncio.sleep', acknowledge)
+        with pytest.raises(PipelineError): await runtime.before_request()
+    asyncio.run(run())
+    assert runtime.report()['controlled_attempts'] == 1

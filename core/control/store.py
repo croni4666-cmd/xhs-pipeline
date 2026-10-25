@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 import re
 import time
-from ..contracts import BudgetExceededError, PipelineError
+from ..contracts import BudgetExceededError, DriverError, PipelineError
 from ..persistence import atomic_write_json, file_lock
 from ..security import safe_component
 from .contracts import ControlPausedError, PAUSE_STATES, SessionState
@@ -86,10 +86,12 @@ class ControlStore:
         def update(data): data.update(state='unknown', paused=False)
         self._transaction(scope, update)
 
-    def reserve(self, scope, task_id, policy):
+    def reserve(self, scope, task_id, policy, *, probe=False):
         safe_component(task_id)
         def reserve(data):
             if data['paused']: raise ControlPausedError(data['state'])
+            if probe is not True and data['state'] != 'ready':
+                raise DriverError('Session has not been verified; normal request refused')
             now = time.time()
             # Future timestamps are retained conservatively when the clock moves backwards.
             data['requests'] = [item for item in data['requests'] if now - item['at'] < 86400]

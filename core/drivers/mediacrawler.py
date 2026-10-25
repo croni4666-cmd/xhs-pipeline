@@ -69,6 +69,7 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         return RuntimeCapabilities(True, True, True)
 
     async def prepare_run(self, runtime):
+        runtime.begin_attempt()
         self._runtime = runtime
 
     def _observe_control_line(self, line, channel):
@@ -263,11 +264,11 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
             if not data.strip():
                 continue
             output_files["jsonl" if not output_files else f"jsonl_{len(output_files)}"] = str(file)
-            for index, line in enumerate(data.decode("utf-8").splitlines(), 1):
+            for index, line in enumerate(data.splitlines(), 1):
                 if not line.strip():
                     continue
                 try:
-                    raw = json.loads(line)
+                    raw = json.loads(line.decode('utf-8'))
                     keyword = raw.get("source_keyword")
                     if request.keywords and keyword not in request.keywords:
                         continue
@@ -290,6 +291,8 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
         if not await self.health_check():
             return CrawlResponse(False, self.name, 0, [], errors=["Local CDP endpoint is unavailable"])
         async with async_file_lock(Path(self.mediacrawler_path) / ".xhs-pipeline.lock"):
+            if self._runtime is not None:
+                self._runtime.begin_attempt()
             self._configure_mediacrawler(request)
             data_dir = Path(self.cfg.get("mediacrawler_output_dir", str(Path(self.mediacrawler_path) / "data" / "xhs" / "jsonl")))
             before = {}
@@ -320,7 +323,7 @@ class MediaCrawlerDriver(BaseCrawlerDriver):
                 if self._runtime is not None:
                     from .process_monitor import monitor_process
                     stdout, stderr = await monitor_process(process, self._observe_control_line, self._terminate, timeout, input_payload)
-                    if self._runtime.report()['state'] != 'ready':
+                    if not self._runtime.session_verified:
                         raise DriverError('MediaCrawler did not confirm a valid existing session')
                 else:
                     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)

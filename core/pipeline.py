@@ -117,7 +117,10 @@ class XhsPipeline:
                                             self.settings.get('controlled_requests_per_day', 100)))
 
     async def execute_crawl(self, request, driver_name=None, fallback_driver=None):
-        runtime = self.create_runtime(request) if self.settings.get('require_runtime_control', True) is True else None
+        required = self.settings.get('require_runtime_control', True)
+        if type(required) is not bool:
+            raise PipelineError('require_runtime_control must be a Boolean; only explicit false disables it')
+        runtime = self.create_runtime(request) if required else None
         leases = []
         try:
             return await self._execute_crawl(request, driver_name, fallback_driver, runtime, leases)
@@ -158,7 +161,11 @@ class XhsPipeline:
                 runtime.check_pause()
                 if not driver.runtime_capabilities.supported:
                     raise CapabilityUnsupportedError('Live driver does not implement required runtime control hooks')
-                await driver.prepare_run(runtime)
+                runtime.begin_attempt()
+                try:
+                    await driver.prepare_run(runtime)
+                except (AuthenticationError, RateLimitError) as exc:
+                    runtime.pause(SessionState.AUTH_REQUIRED if isinstance(exc, AuthenticationError) else SessionState.RATE_LIMITED)
             breaker = self.router.get_circuit_breaker(name)
             backoff = getattr(self, "backoff", ExponentialBackoff(max_retries=1))
 
@@ -172,7 +179,7 @@ class XhsPipeline:
                     result = await driver.crawl_keywords(request)
                     if runtime is not None and not driver.is_synthetic:
                         runtime.check_pause()
-                        if runtime.report()['state'] != 'ready':
+                        if not runtime.session_verified:
                             raise DriverError('Driver did not verify its session; success refused')
                     if not isinstance(result, CrawlResponse):
                         raise DriverError("Driver returned an invalid response")

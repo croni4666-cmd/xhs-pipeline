@@ -28,6 +28,10 @@ class RuntimeContext:
         self.store.observe(self.scope, SessionState.READY)
         self._verified = True
 
+    def begin_attempt(self):
+        """Persisted readiness is history; every adapter invocation needs a fresh probe."""
+        self.observe(SessionState.UNKNOWN)
+
     @property
     def session_verified(self):
         return self._verified and self.store.read(self.scope)['state'] == 'ready'
@@ -45,11 +49,11 @@ class RuntimeContext:
         raise ControlPausedError(state)
 
     async def before_request(self, *, probe=False):
-        self.check_pause()
-        if not self.session_verified and probe is not True:
-            raise DriverError('Session has not been verified; normal request refused')
         while True:
-            delay = self.store.reserve(self.scope, self.task_id, self.policy)
+            self.check_pause()
+            if not self.session_verified and probe is not True:
+                raise DriverError('Session has not been verified; normal request refused')
+            delay = self.store.reserve(self.scope, self.task_id, self.policy, probe=probe is True)
             if not delay: return
             await asyncio.sleep(min(delay, 1))
 
@@ -57,6 +61,7 @@ class RuntimeContext:
         data = self.store.read(self.scope)
         records = [item for item in data['requests'] if time.time() - item['at'] < 86400]
         return {'scope_hash': self.scope, 'state': data['state'], 'paused': data['paused'],
+                'session_verified': self._verified and data['state'] == 'ready',
                 'controlled_attempts': sum(item['task'] == self.task_id for item in records),
                 'requests_24h': len(records), 'coverage': 'adapter_hooks', 'limits': asdict(self.policy)}
 

@@ -70,6 +70,27 @@ def test_missing_session_event_is_not_a_valid_session(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
+def test_silent_child_cannot_reuse_previous_ready_state(tmp_path, monkeypatch):
+    driver, old = controlled(tmp_path)
+    old.mark_ready()
+    runtime = RuntimeContext(old.store, 'p', 's', 'new_task', old.policy)
+    class SilentProcess:
+        returncode = 0
+        stdin = None
+        def __init__(self):
+            self.stdout, self.stderr = asyncio.StreamReader(), asyncio.StreamReader()
+            self.stdout.feed_eof(); self.stderr.feed_eof()
+        async def wait(self): return 0
+    async def spawn(*args, **kwargs): return SilentProcess()
+    monkeypatch.setattr('core.drivers.mediacrawler.asyncio.create_subprocess_exec', spawn)
+    async def run():
+        await driver.prepare_run(runtime)
+        with pytest.raises(PipelineError, match='confirm|verified'):
+            await driver.crawl_keywords(CrawlRequest(['audit']))
+    asyncio.run(run())
+    assert not runtime.session_verified
+
+
 def test_malformed_event_and_oversized_output_fail_closed(tmp_path, monkeypatch):
     driver, runtime = controlled(tmp_path)
     class BadEventProcess:
@@ -180,7 +201,8 @@ def test_guarded_subprocess_end_to_end_with_fake_provider(tmp_path):
     assert report['state'] == 'ready' and not report['paused'] and report['controlled_attempts'] == 2
 
 
-def test_midrun_risk_pause_preserves_partial_captured_notes(tmp_path, monkeypatch):
+@pytest.mark.parametrize('interrupted_tail', [b'', b'\xf0\x9f'])
+def test_midrun_risk_pause_preserves_partial_captured_notes(tmp_path, monkeypatch, interrupted_tail):
     driver, runtime = controlled(tmp_path)
     out_dir = tmp_path / 'mc' / 'data' / 'xhs' / 'jsonl'
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +214,8 @@ def test_midrun_risk_pause_preserves_partial_captured_notes(tmp_path, monkeypatc
                 '{"note_id":"n_partial","title":"Saved","desc":"Body","source_keyword":"audit"}\n',
                 encoding='utf-8'
             )
+            with (out_dir / 'search_contents_partial.jsonl').open('ab') as output:
+                output.write(interrupted_tail)
             self.stdout, self.stderr = asyncio.StreamReader(), asyncio.StreamReader()
             self.stdout.feed_data(
                 b'XHS_CONTROL_EVENT {"schema": "runtime_event_v1", "state": "ready"}\n'
