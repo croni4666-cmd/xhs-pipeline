@@ -44,6 +44,9 @@ def main():
         restored = run(['--resume-state', 'task.json', '--allow-synthetic', '--max-budget', '0',
                         '--export-obsidian', 'cards', '--snapshot-file', 'resumed.json', '--format', 'json'], 0)
         assert restored['operation'] == 'offline_resume' and restored['budget_stats']['used_requests'] == 0
+        continued = run(['--continue-from-snapshot', 'task.json', '--allow-synthetic', '--max-budget', '0',
+                         '--snapshot-file', 'continued.json', '--format', 'json'], 0)
+        assert continued['operation'] == 'online_continue' and continued['budget_stats']['used_requests'] == 0
         assert all(card.read_bytes() == data and card.stat().st_mtime_ns == stamp for card, (data, stamp) in before.items())
         original = json.loads((cwd / 'task.json').read_text(encoding='utf-8'))['payload']
         resumed = json.loads((cwd / 'resumed.json').read_text(encoding='utf-8'))['payload']

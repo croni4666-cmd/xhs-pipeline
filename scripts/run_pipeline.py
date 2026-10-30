@@ -47,6 +47,7 @@ async def main():
     parser.add_argument("--media", action="store_true", help="Enable media download in the external driver")
     inputs.add_argument("--resume-from", "-r", type=str, default="", help="Resume downstream processing from raw JSONL file")
     inputs.add_argument("--resume-state", type=str, default="", help="Recover a complete task snapshot offline")
+    inputs.add_argument("--continue-from-snapshot", type=str, default="", help="Continue unfinished keywords from a task snapshot online")
     inputs.add_argument('--control-status', action='store_true', help='Read local online-control state without platform access')
     inputs.add_argument('--acknowledge-pause', action='store_true', help='Acknowledge local pause; next online task must verify its session again')
     parser.add_argument('--control-scope', default=None, help='Nonsecret persistent session scope shared across crawler frameworks')
@@ -62,7 +63,7 @@ async def main():
     args = parser.parse_args()
     if args.limit < 1 or args.max_budget < 0 or args.rate_limit < 1:
         parser.error("limit/rate-limit must be positive and max-budget nonnegative")
-    if args.health_check and (args.keywords or args.resume_from or args.resume_state or args.control_status or args.acknowledge_pause):
+    if args.health_check and (args.keywords or args.resume_from or args.resume_state or args.continue_from_snapshot or args.control_status or args.acknowledge_pause):
         parser.error("health-check cannot be combined with a capture or recovery input")
     pipeline = XhsPipeline(args.settings) if args.settings else XhsPipeline()
     if args.allow_synthetic and hasattr(pipeline, "settings"):
@@ -137,9 +138,9 @@ async def main():
                 print(f"[x] Failed loading cache: {redact_error(e)}")
             sys.exit(1)
 
-    # 3. Live Crawl Mode
-    elif args.keywords:
-        keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
+    # 3. Live Crawl or Online Snapshot Continuation Mode
+    elif args.keywords or args.continue_from_snapshot:
+        keywords = [k.strip() for k in args.keywords.split(",") if k.strip()] if args.keywords else []
         request = CrawlRequest(
             keywords=keywords,
             max_count_per_keyword=args.limit,
@@ -147,25 +148,31 @@ async def main():
             sort_type=args.sort, allow_synthetic=args.allow_synthetic
         )
         if args.format != "json":
-            print(f"[*] Starting crawl via driver '{args.driver}' (fallback: '{args.fallback_driver}')...")
-            print(f"[*] Keywords: {keywords} | Limit: {args.limit} | Budget: {args.max_budget}")
+            if args.continue_from_snapshot:
+                print(f"[*] Continuing incomplete snapshot online: {args.continue_from_snapshot}")
+            else:
+                print(f"[*] Starting crawl via driver '{args.driver}' (fallback: '{args.fallback_driver}')...")
+                print(f"[*] Keywords: {keywords} | Limit: {args.limit} | Budget: {args.max_budget}")
 
         def fail_capture(error, name, code):
             result = {'success': False, 'error': name, 'message': redact_error(error)}
             if args.snapshot_file:
                 try:
-                    manifest = pipeline.checkpoint_store.load_task_manifest(request.task_id)
+                    partial = getattr(error, 'partial_response', None)
+                    manifest = (partial.manifest if isinstance(partial, CrawlResponse) and partial.manifest is not None
+                                else pipeline.checkpoint_store.load_task_manifest(request.task_id))
                     if manifest is None:
                         raise RuntimeError('The failed task has no recoverable manifest')
-                    partial = getattr(error, 'partial_response', None)
                     partial_notes = list(partial.notes) if isinstance(partial, CrawlResponse) else []
+                    lineage = list(partial.snapshot_lineage) if isinstance(partial, CrawlResponse) else []
                     failed = CrawlResponse(False, manifest.driver_name, len(partial_notes), partial_notes,
                                            errors=list(manifest.errors), is_partial=bool(partial_notes),
                                            manifest=manifest, is_synthetic=manifest.is_synthetic,
                                            data_source=manifest.data_source,
                                            detail_success_count=manifest.detail_success_count,
                                            detail_failed_count=manifest.detail_failed_count,
-                                           actual_request_count=manifest.actual_request_count)
+                                           actual_request_count=manifest.actual_request_count,
+                                           snapshot_lineage=lineage)
                     pipeline.save_task_snapshot(failed, args.snapshot_file)
                     result['snapshot_path'] = args.snapshot_file
                 except Exception as snapshot_error:
@@ -179,11 +186,22 @@ async def main():
             sys.exit(code)
 
         try:
-            response = await pipeline.execute_crawl(
-                request,
-                driver_name=args.driver,
-                fallback_driver=args.fallback_driver
-            )
+            if args.continue_from_snapshot:
+                explicit_driver = args.driver if ("--driver" in sys.argv or "-d" in sys.argv) else None
+                explicit_limit = args.limit if ("--limit" in sys.argv or "-l" in sys.argv) else None
+                response = await pipeline.continue_task_snapshot(
+                    args.continue_from_snapshot,
+                    driver_name=explicit_driver,
+                    fallback_driver=args.fallback_driver,
+                    allow_synthetic=args.allow_synthetic,
+                    limit_per_keyword=explicit_limit,
+                )
+            else:
+                response = await pipeline.execute_crawl(
+                    request,
+                    driver_name=args.driver,
+                    fallback_driver=args.fallback_driver
+                )
             notes = response.notes
             crawl_errors = [redact_error(error) for error in response.errors]
             is_partial = response.is_partial
@@ -202,9 +220,9 @@ async def main():
             fail_capture(e, 'UnexpectedError', 2)
     else:
         if args.format == "json":
-            print(json.dumps({"error": "One of --keywords, --resume-from or --resume-state is required"}))
+            print(json.dumps({"error": "One of --keywords, --resume-from, --resume-state or --continue-from-snapshot is required"}))
         else:
-            print("[!] Error: One of --keywords, --resume-from or --resume-state is required.")
+            print("[!] Error: One of --keywords, --resume-from, --resume-state or --continue-from-snapshot is required.")
         sys.exit(1)
 
     # 4. Optional Insight Analysis
@@ -259,7 +277,7 @@ async def main():
             "operation": getattr(getattr(response, 'manifest', None), 'operation', 'crawl'),
             "task_id": getattr(getattr(response, 'manifest', None), 'task_id', None),
             "parent_task_id": getattr(getattr(response, 'manifest', None), 'parent_task_id', None),
-            "budget_stats": pipeline.budget_manager.get_stats()
+            "budget_stats": getattr(getattr(response, 'manifest', None), 'budget_stats', None) or pipeline.budget_manager.get_stats()
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
@@ -278,6 +296,9 @@ async def main():
 
 def cli_entrypoint():
     """Synchronous entrypoint wrapper for setuptools console scripts."""
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
     try:
         asyncio.run(main())
     except SystemExit as e:

@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+- 新增多关键词快照在线增量续跑（`continue_task_snapshot` / `--continue-from-snapshot`，操作类型 `online_continue`）：自动跳过已达到单关键词配额的关键词，仅对未完成关键词执行受控在线抓取，无损合并历史笔记、分析洞察与 `snapshot_lineage`；若全部关键词已达标则零请求短路完成；若再次中途暂停仍完整保留父快照样本与来源链。
+- `DataCleaner.deduplicate_notes` 在多轮去重合并时保留并合并笔记已有的 `ContentInsight` 分析结论；CLI JSON 输出 `budget_stats` 完整透传任务级 `task_driver_attempts` 与 `runtime_control` 报告。
+
 ## [0.4.0rc1] - 2026-10-30
 
 - 运行控制复核修复：新调用必须完成本次会话验证；准备阶段认证失败和限速等待时的状态变化均阻断普通请求；控制开关严格要求布尔类型。
