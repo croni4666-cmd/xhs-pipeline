@@ -137,8 +137,10 @@ def test_online_continuation_short_circuits_with_zero_requests_when_quota_met(tm
     monkeypatch.setattr(pipe, 'execute_crawl', forbidden)
     continued = asyncio.run(pipe.continue_task_snapshot(str(snap_path)))
     assert continued.success and not continued.is_partial
+    assert continued.driver_name == 'offline_snapshot'
     assert continued.actual_request_count == 0
     assert continued.manifest.operation == 'online_continue'
+    assert continued.manifest.driver_name == 'offline_snapshot'
     assert continued.manifest.parent_task_id == initial.manifest.task_id
     assert len(continued.notes) == 2
 
@@ -192,3 +194,37 @@ def test_cli_continue_from_snapshot_and_budget_stats_reporting(tmp_path):
     assert continued['operation'] == 'online_continue'
     assert continued['parent_task_id'] == first['task_id']
     assert continued['total_notes'] >= 2
+
+
+def test_partial_keyword_deficit_and_duplicate_keywords_deduplicated(tmp_path):
+    pipe, _ = make_pipeline(tmp_path)
+    note_a = UnifiedNote('kwA_existing', title='Existing', desc='Body.',
+                         media_presence=FieldPresence.KNOWN_EMPTY, data_source='live')
+    note_a.add_discovery('kwA', rank=1, discovered_at=10)
+    manifest = CrawlTaskManifest(
+        'parent_deficit', 'inc_driver', 'v1', __version__, 10, completed_at=20,
+        keywords=['kwA', 'kwA'], request_quota=3, actual_discovered_count=1, deduplicated_count=1,
+        stop_reason='online_paused',
+        discovery_trails=[{'note_id': 'kwA_existing', **asdict(note_a.discovery_records[0])}],
+        content_hashes={'kwA_existing': note_a.content_hash},
+        effective_config={'request': {'keywords': ['kwA', 'kwA'], 'limit_per_keyword': 3}},
+        config_fingerprint='b' * 64, data_source='live'
+    )
+    partial_resp = CrawlResponse(False, 'inc_driver', 1, [note_a], is_partial=True,
+                                 manifest=manifest, data_source='live')
+    snap_path = tmp_path / 'deficit.json'
+    pipe.save_task_snapshot(partial_resp, str(snap_path))
+
+    limits_seen = []
+    class DeficitCheckingDriver(IncrementalDriver):
+        async def crawl_keywords(self, request: CrawlRequest) -> CrawlResponse:
+            limits_seen.append(request.max_count_per_keyword)
+            return await super().crawl_keywords(request)
+
+    driver = DeficitCheckingDriver('inc_driver')
+    pipe.register_driver(driver)
+    continued = asyncio.run(pipe.continue_task_snapshot(str(snap_path)))
+    assert driver.requested_keywords == [['kwA']]
+    assert limits_seen == [2]
+    assert continued.manifest.keywords == ['kwA']
+    assert len(continued.notes) == 3

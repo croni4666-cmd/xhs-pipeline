@@ -377,7 +377,7 @@ class XhsPipeline:
         if parent is not None:
             response.snapshot_lineage.append(deepcopy(parent))
         started = time.time()
-        response.driver_name = 'offline_snapshot' if operation == 'offline_resume' else 'offline_jsonl'
+        response.driver_name = 'offline_snapshot' if operation in ('offline_resume', 'online_continue') else 'offline_jsonl'
         response.references, response.output_files = [], {}
         response.actual_request_count = 0
         response.detail_success_count, response.detail_failed_count = 0, 0
@@ -438,32 +438,36 @@ class XhsPipeline:
             target_limit = max(1, parent.request_quota // len(parent.keywords))
         else:
             target_limit = int(self.settings.get('default_limit', 20))
-        by_keyword: Dict[str, set] = {kw: set() for kw in parent.keywords}
+        ordered_keywords = list(dict.fromkeys(kw for kw in parent.keywords if isinstance(kw, str) and kw.strip()))
+        if not ordered_keywords:
+            raise PipelineError('Snapshot does not contain resumable keyword metadata')
+        by_keyword: Dict[str, set] = {kw: set() for kw in ordered_keywords}
         for note in prior.notes:
             for rec in note.discovery_records:
                 if rec.keyword in by_keyword:
                     by_keyword[rec.keyword].add(note.note_id)
-        remaining = [kw for kw in parent.keywords if len(by_keyword.get(kw, set())) < target_limit]
-        completed = [kw for kw in parent.keywords if kw not in remaining]
+        remaining = [kw for kw in ordered_keywords if len(by_keyword.get(kw, set())) < target_limit]
+        completed = [kw for kw in ordered_keywords if kw not in remaining]
         lineage = [*deepcopy(prior.snapshot_lineage), deepcopy(parent)]
         if not remaining:
             prior.success = True
             prior.is_partial = False
             return self._record_offline_response(prior, 'online_continue')
+        max_deficit = max(target_limit - len(by_keyword.get(kw, set())) for kw in remaining)
         criteria = parent.filter_criteria if isinstance(parent.filter_criteria, dict) else {}
         sort_type = parent.sort_type if parent.sort_type in ('general', 'popularity_descending', 'latest', 'time_descending') else 'popularity_descending'
         selected_driver = driver_name or (parent.driver_name if parent.driver_name in self.drivers else None)
         allowed = allow_synthetic is True or self.settings.get('allow_synthetic') is True
         request = CrawlRequest(
-            keywords=remaining, max_count_per_keyword=target_limit,
+            keywords=remaining, max_count_per_keyword=max_deficit,
             enable_comments=bool(criteria.get('comments', False)),
             enable_media=bool(criteria.get('media', False)),
             sort_type=sort_type, allow_synthetic=allowed,
         )
         prior_notes = [deepcopy(n) for n in prior.notes]
         def _bind_lineage(manifest, merged_notes):
-            manifest.keywords = list(parent.keywords)
-            manifest.request_quota = target_limit * len(remaining)
+            manifest.keywords = list(ordered_keywords)
+            manifest.request_quota = max_deficit * len(remaining)
             manifest.deduplicated_count = len(merged_notes)
             manifest.discovery_trails = [{'note_id': n.note_id, **asdict(ev)} for n in merged_notes for ev in n.discovery_records]
             manifest.content_hashes = {n.note_id: n.content_hash for n in merged_notes}
