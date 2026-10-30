@@ -21,7 +21,9 @@ if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
 from core.contracts import UnifiedNote, ContentInsight, StageStatus
+from core.persistence import atomic_write_json
 from core.pipeline import XhsPipeline
+from core.security import redact_error
 
 
 PATTERNS = [
@@ -64,13 +66,34 @@ def extract_insights_for_note(note: UnifiedNote, model_name: str = "empirical-mi
     return insight
 
 
-def analyze_corpus(jsonl_path: str, output_insights: Optional[str] = None, output_format: str = "text") -> List[ContentInsight]:
-    pipeline = XhsPipeline()
-    notes = pipeline.load_from_jsonl(jsonl_path)
+def _load_notes(pipeline: XhsPipeline, input_path: str, *, is_snapshot: bool = False, allow_synthetic: bool = False) -> List[UnifiedNote]:
+    if is_snapshot:
+        return pipeline.load_task_snapshot(input_path, allow_synthetic=allow_synthetic).notes
+    try:
+        with open(input_path, "r", encoding="utf-8") as stream:
+            head = stream.read(4096).lstrip()
+        if head.startswith("{") and '"xhs_task_snapshot_v1"' in head:
+            return pipeline.load_task_snapshot(input_path, allow_synthetic=allow_synthetic).notes
+    except OSError:
+        pass
+    return pipeline.load_from_jsonl(input_path, allow_synthetic=allow_synthetic)
+
+
+def analyze_corpus(
+    jsonl_path: str,
+    output_insights: Optional[str] = None,
+    output_format: str = "text",
+    *,
+    is_snapshot: bool = False,
+    allow_synthetic: bool = False,
+    settings_path: Optional[str] = None,
+) -> List[ContentInsight]:
+    pipeline = XhsPipeline(settings_path) if settings_path else XhsPipeline()
+    notes = _load_notes(pipeline, jsonl_path, is_snapshot=is_snapshot, allow_synthetic=allow_synthetic)
 
     if not notes:
         if output_format == "json":
-            print(json.dumps({"error": "No notes found in dataset", "notes_count": 0}))
+            print(json.dumps({"success": True, "error": "No notes found in dataset", "notes_count": 0}))
         else:
             print("[!] No notes found in dataset.")
         return []
@@ -83,12 +106,34 @@ def analyze_corpus(jsonl_path: str, output_insights: Optional[str] = None, outpu
         n.stage_status = StageStatus.ANALYZED
         all_insights.append(ins)
 
+    if output_insights:
+        Path(output_insights).parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            output_insights,
+            [
+                {
+                    "insight_id": ins.insight_id,
+                    "note_id": ins.note_id,
+                    "hook_archetype": ins.hook_archetype,
+                    "model_name": ins.model_name,
+                    "prompt_version": ins.prompt_version,
+                    "content_hash": ins.input_content_hash,
+                    "evidence_snippets": ins.evidence_snippets,
+                    "confidence_score": ins.confidence_score,
+                    "analyzed_at": ins.analyzed_at
+                }
+                for ins in all_insights
+            ]
+        )
+
     if output_format == "json":
         report_data = {
+            "success": True,
             "total_notes": len(notes),
             "analyzed_at": time.time(),
             "model_name": "empirical-miner-v1",
             "prompt_version": "2026.10",
+            "output_insights_path": output_insights or "",
             "top_notes": [
                 {
                     "note_id": n.note_id,
@@ -150,34 +195,36 @@ def analyze_corpus(jsonl_path: str, output_insights: Optional[str] = None, outpu
         print("\n💡 【分析溯源元数据】")
         print("• 分析引擎: empirical-miner-v1 | 规约版本: 2026.10")
         print(f"• 完整生成可追溯证据结论: {len(all_insights)} 条")
-
-    if output_insights:
-        Path(output_insights).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_insights, "w", encoding="utf-8") as f:
-            json.dump([
-                {
-                    "insight_id": ins.insight_id,
-                    "note_id": ins.note_id,
-                    "hook_archetype": ins.hook_archetype,
-                    "model_name": ins.model_name,
-                    "prompt_version": ins.prompt_version,
-                    "content_hash": ins.input_content_hash,
-                    "evidence_snippets": ins.evidence_snippets,
-                    "confidence_score": ins.confidence_score,
-                    "analyzed_at": ins.analyzed_at
-                }
-                for ins in all_insights
-            ], f, indent=2, ensure_ascii=False)
-        print(f"\n[+] 可溯源分析洞察结果已保存至: {output_insights}")
+        if output_insights:
+            print(f"\n[+] 可溯源分析洞察结果已保存至: {output_insights}")
 
     return all_insights
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze XHS Corpus with Traceable Insights")
-    parser.add_argument("--input", "-i", type=str, required=True, help="Path to scraped JSONL file")
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--input", "-i", type=str, default="", help="Path to scraped JSONL or snapshot file")
+    inputs.add_argument("--snapshot", type=str, default="", help="Path to versioned task snapshot JSON")
     parser.add_argument("--output-insights", "-o", type=str, default="", help="Path to save structured insights JSON")
+    parser.add_argument("--allow-synthetic", action="store_true", help="Explicitly permit labeled synthetic data")
+    parser.add_argument("--settings", default=None, help="Local settings JSON")
     parser.add_argument("--format", "-f", choices=["text", "json"], default="text", help="Output format (text or json)")
     args = parser.parse_args()
 
-    analyze_corpus(args.input, output_insights=args.output_insights, output_format=args.format)
+    try:
+        analyze_corpus(
+            args.snapshot or args.input,
+            output_insights=args.output_insights,
+            output_format=args.format,
+            is_snapshot=bool(args.snapshot),
+            allow_synthetic=args.allow_synthetic,
+            settings_path=args.settings,
+        )
+    except Exception as exc:
+        msg = redact_error(exc)
+        if args.format == "json":
+            print(json.dumps({"success": False, "error": type(exc).__name__, "message": msg}, ensure_ascii=False))
+        else:
+            sys.stderr.write(f"[x] Analysis failed: {msg}\n")
+        sys.exit(1)
