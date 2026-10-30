@@ -81,10 +81,16 @@ python scripts/run_pipeline.py `
   --export-obsidian "./obsidian_cards"
 ```
 
-### 5. 样本内容模式与特征分析 (可追溯证据引用)
+### 5. 样本内容模式与特征分析 / 独立脚本导出 (支持 JSONL 与快照输入)
 ```powershell
 python scripts/analyze_insights.py `
-  --input "./data/xhs/jsonl/search_contents.jsonl" `
+  --snapshot "./data/task.json" `
+  --output-insights "./data/insights.json" `
+  --format json
+
+python scripts/export_obsidian.py `
+  --snapshot "./data/task.json" `
+  --output "./obsidian_cards" `
   --format json
 ```
 

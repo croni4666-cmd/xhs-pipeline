@@ -296,6 +296,9 @@ async def main():
 
 def cli_entrypoint():
     """Synchronous entrypoint wrapper for setuptools console scripts."""
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
     try:
         asyncio.run(main())
     except SystemExit as e:

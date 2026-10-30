@@ -202,6 +202,9 @@ def analyze_corpus(
 
 
 if __name__ == "__main__":
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Analyze XHS Corpus with Traceable Insights")
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--input", "-i", type=str, default="", help="Path to scraped JSONL or snapshot file")
