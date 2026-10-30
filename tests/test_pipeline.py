@@ -60,14 +60,14 @@ def test_version_consistency():
     file_version = version_file.read_text(encoding="utf-8").strip()
 
     assert file_version == __version__, f"VERSION file ({file_version}) != core.__version__ ({__version__})"
-    assert __version__ == "0.3.2rc3", f"Expected version 0.3.2rc3, got {__version__}"
+    assert __version__ == "0.4.0rc1", f"Expected version 0.4.0rc1, got {__version__}"
 
     pyproject_file = Path(root_dir) / "pyproject.toml"
-    assert 'version = "0.3.2rc3"' in pyproject_file.read_text(encoding="utf-8")
+    assert 'version = "0.4.0rc1"' in pyproject_file.read_text(encoding="utf-8")
 
     changelog_file = Path(root_dir) / "CHANGELOG.md"
-    assert '## [0.3.2rc3]' in changelog_file.read_text(encoding="utf-8")
-    print("[√] Version consistency verified (0.3.2rc3).")
+    assert '## [0.4.0rc1]' in changelog_file.read_text(encoding="utf-8")
+    print("[√] Version consistency verified (0.4.0rc1).")
 
 
 def test_field_presence_and_metric_parsing():

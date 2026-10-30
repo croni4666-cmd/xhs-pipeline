@@ -3,7 +3,7 @@
 xhs-pipeline: Industrial Xiaohongshu Intelligence, Research Reproducibility & PKM Pipeline
 """
 
-__version__ = "0.3.2rc3"
+__version__ = "0.4.0rc1"
 __author__ = "Antigravity Engineering"
 __license__ = "MIT"
 

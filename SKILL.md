@@ -16,7 +16,7 @@ triggers:
   - xiaohongshu skill
 ---
 
-# 📕 xhs-pipeline: 小红书智能研究与资产化管线 (v0.3.2-rc3)
+# 📕 xhs-pipeline: 小红书智能研究与资产化管线 (v0.4.0-rc1)
 
 预发布采集调度与知识沉淀 Skill。使用前遵守 README 和 SECURITY.md 中的当前能力边界，不将模拟数据作为真实样本，不自动发布采集结果或访问凭证。
 
@@ -94,7 +94,7 @@ python scripts/analyze_insights.py `
 
 | 模块 / 规范文件 | 工程定位与职责说明 |
 | :--- | :--- |
-| [`VERSION`](VERSION) | 单一真实来源的语义化版本号标识 (`0.3.0`) |
+| [`VERSION`](VERSION) | 单一真实来源的语义化版本号标识 (`0.4.0rc1`) |
 | [`CHANGELOG.md`](CHANGELOG.md) | 遵循 Keep a Changelog 规范的详细变更履历与升级说明 |
 | [`LICENSE`](LICENSE) | MIT 开源许可证 |
 | [`pyproject.toml`](pyproject.toml) | 遵循 PEP 621 标准的现代化包构建元数据与 CLI 声明 |
