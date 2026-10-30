@@ -73,8 +73,8 @@ python scripts/run_pipeline.py `
   --export-csv "./data/summary.csv"
 ```
 
-### 4. 离线断点恢复 (零网络开销复用已有数据)
-完整任务使用统一 CLI 的 --resume-state 恢复 --snapshot-file 生成的快照；原始 JSONL 使用 --resume-from。恢复保留已有洞察、原始状态与清单来源链，不触发采集驱动。依赖访问凭证的在线查询仍需重新搜索；模拟输入必须显式 --allow-synthetic。
+### 4. 离线断点恢复与在线增量续跑
+完整任务使用统一 CLI 的 `--resume-state` 离线恢复 `--snapshot-file` 生成的快照；若多关键词任务因风控或配额中途中断并已人工确认解除暂停，可使用 `--continue-from-snapshot` 仅对未达标关键词继续在线采集并无损合并已有笔记、洞察与来源链；原始 JSONL 使用 `--resume-from`。模拟输入必须显式 `--allow-synthetic`。
 ```powershell
 python scripts/run_pipeline.py `
   --resume-from "./data/xhs/jsonl/search_contents.jsonl" `

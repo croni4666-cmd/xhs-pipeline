@@ -162,7 +162,7 @@ def _decode(payload, allow_synthetic):
         if item.task_id in identities:
             raise SnapshotError('Snapshot task lineage contains a cycle or duplicate identity')
         identities.add(item.task_id)
-        if item.operation == 'offline_resume':
+        if item.operation in ('offline_resume', 'online_continue'):
             if previous is None or item.parent_task_id != previous.task_id:
                 raise SnapshotError('Snapshot offline task has no matching parent')
             _hash(item.source_snapshot_hash)

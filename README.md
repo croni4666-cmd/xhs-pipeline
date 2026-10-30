@@ -47,6 +47,12 @@ xhs-pipeline --resume-from ./data/search_contents.jsonl --export-obsidian ./obsi
 xhs-pipeline --resume-state ./data/task.json --allow-synthetic --max-budget 0 --snapshot-file ./data/resumed.json --export-obsidian ./obsidian_cards --format json
 ```
 
+从中断/部分成功的快照继续在线抓取剩余未完成关键词（自动跳过已达标关键词并合并历史样本与来源链）：
+
+```bash
+xhs-pipeline --continue-from-snapshot ./data/task.json --driver mediacrawler --snapshot-file ./data/continued.json --export-obsidian ./obsidian_cards --format json
+```
+
 查看或人工解除本地在线采集风险暂停（不触发网络请求，保留 24 小时请求配额记录）：
 
 ```bash

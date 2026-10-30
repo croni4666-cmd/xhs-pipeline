@@ -75,6 +75,9 @@ class DataCleaner:
             for event in note.discovery_records:
                 if event not in existing.discovery_records:
                     existing.discovery_records.append(deepcopy(event))
+            for insight in note.insights:
+                if insight not in existing.insights:
+                    existing.insights.append(deepcopy(insight))
             newer = note.crawled_at >= existing.crawled_at
             complete = note.completeness == ContentCompleteness.FULL and note.desc_presence == FieldPresence.VALID
             upgrade = (complete and (existing.completeness != ContentCompleteness.FULL or newer)

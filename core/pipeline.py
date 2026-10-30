@@ -412,6 +412,105 @@ class XhsPipeline:
         response = self.load_task_snapshot(file_path, allow_synthetic=allow_synthetic)
         return self._record_offline_response(response, 'offline_resume')
 
+    async def continue_task_snapshot(
+        self,
+        file_path: str,
+        *,
+        driver_name: Optional[str] = None,
+        fallback_driver: Optional[str] = None,
+        allow_synthetic: bool = False,
+        limit_per_keyword: Optional[int] = None,
+    ) -> CrawlResponse:
+        """Continue an incomplete multi-keyword snapshot online, skipping already satisfied keywords."""
+        from copy import deepcopy
+        from .security import public_config
+        prior = self.load_task_snapshot(file_path, allow_synthetic=allow_synthetic)
+        parent = prior.manifest
+        if parent is None or not parent.keywords:
+            raise PipelineError('Snapshot does not contain resumable keyword metadata')
+        req_cfg = parent.effective_config.get('request', {}) if isinstance(parent.effective_config, dict) else {}
+        cfg_limit = req_cfg.get('limit_per_keyword') if isinstance(req_cfg, dict) else None
+        if type(limit_per_keyword) is int and limit_per_keyword >= 1:
+            target_limit = limit_per_keyword
+        elif type(cfg_limit) is int and cfg_limit >= 1:
+            target_limit = cfg_limit
+        elif type(parent.request_quota) is int and parent.request_quota >= 1:
+            target_limit = max(1, parent.request_quota // len(parent.keywords))
+        else:
+            target_limit = int(self.settings.get('default_limit', 20))
+        by_keyword: Dict[str, set] = {kw: set() for kw in parent.keywords}
+        for note in prior.notes:
+            for rec in note.discovery_records:
+                if rec.keyword in by_keyword:
+                    by_keyword[rec.keyword].add(note.note_id)
+        remaining = [kw for kw in parent.keywords if len(by_keyword.get(kw, set())) < target_limit]
+        completed = [kw for kw in parent.keywords if kw not in remaining]
+        lineage = [*deepcopy(prior.snapshot_lineage), deepcopy(parent)]
+        if not remaining:
+            prior.success = True
+            prior.is_partial = False
+            return self._record_offline_response(prior, 'online_continue')
+        criteria = parent.filter_criteria if isinstance(parent.filter_criteria, dict) else {}
+        sort_type = parent.sort_type if parent.sort_type in ('general', 'popularity_descending', 'latest', 'time_descending') else 'popularity_descending'
+        selected_driver = driver_name or (parent.driver_name if parent.driver_name in self.drivers else None)
+        allowed = allow_synthetic is True or self.settings.get('allow_synthetic') is True
+        request = CrawlRequest(
+            keywords=remaining, max_count_per_keyword=target_limit,
+            enable_comments=bool(criteria.get('comments', False)),
+            enable_media=bool(criteria.get('media', False)),
+            sort_type=sort_type, allow_synthetic=allowed,
+        )
+        prior_notes = [deepcopy(n) for n in prior.notes]
+        def _bind_lineage(manifest, merged_notes):
+            manifest.keywords = list(parent.keywords)
+            manifest.request_quota = target_limit * len(remaining)
+            manifest.deduplicated_count = len(merged_notes)
+            manifest.discovery_trails = [{'note_id': n.note_id, **asdict(ev)} for n in merged_notes for ev in n.discovery_records]
+            manifest.content_hashes = {n.note_id: n.content_hash for n in merged_notes}
+            manifest.operation = 'online_continue'
+            manifest.parent_task_id = parent.task_id
+            manifest.source_snapshot_hash = prior.snapshot_hash
+            manifest.is_synthetic = manifest.is_synthetic or any(n.is_synthetic for n in merged_notes)
+            eff = dict(manifest.effective_config) if isinstance(manifest.effective_config, dict) else {}
+            eff['continued_keywords'] = list(remaining)
+            eff['completed_keywords'] = list(completed)
+            eff['parent_task_id'] = parent.task_id
+            eff['source_snapshot_hash'] = prior.snapshot_hash
+            manifest.effective_config = public_config(eff)
+            manifest.config_fingerprint = hashlib.sha256(
+                json.dumps(manifest.effective_config, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
+            self.checkpoint_store.save_task_manifest(manifest)
+        try:
+            response = await self.execute_crawl(request, driver_name=selected_driver, fallback_driver=fallback_driver)
+        except BaseException as exc:
+            failed_manifest = self.checkpoint_store.load_task_manifest(request.task_id)
+            partial = getattr(exc, 'partial_response', None)
+            extra_notes = list(partial.notes) if isinstance(partial, CrawlResponse) else []
+            merged = self.cleaner.deduplicate_notes(prior_notes + extra_notes)
+            if failed_manifest is not None:
+                _bind_lineage(failed_manifest, merged)
+            exc.partial_response = CrawlResponse(
+                False, failed_manifest.driver_name if failed_manifest else (selected_driver or 'unknown'),
+                len(merged), merged, errors=list(failed_manifest.errors) if failed_manifest else [str(exc)],
+                is_partial=bool(merged), manifest=failed_manifest,
+                is_synthetic=any(n.is_synthetic for n in merged) or bool(failed_manifest and failed_manifest.is_synthetic),
+                data_source=failed_manifest.data_source if failed_manifest and failed_manifest.data_source != 'unknown' else prior.data_source,
+                detail_success_count=failed_manifest.detail_success_count if failed_manifest else None,
+                detail_failed_count=failed_manifest.detail_failed_count if failed_manifest else None,
+                actual_request_count=failed_manifest.actual_request_count if failed_manifest else None,
+                snapshot_lineage=lineage,
+            )
+            raise
+        merged = self.cleaner.deduplicate_notes(prior_notes + response.notes)
+        response.notes = merged
+        response.total_notes = len(merged)
+        response.is_synthetic = response.is_synthetic or any(n.is_synthetic for n in merged)
+        response.snapshot_lineage = lineage
+        if response.manifest is not None:
+            _bind_lineage(response.manifest, merged)
+        return response
+
     def import_jsonl_task(self, file_path: str, *, allow_synthetic=False) -> CrawlResponse:
         notes = self.load_from_jsonl(file_path, allow_synthetic=allow_synthetic)
         response = CrawlResponse(True, 'offline_jsonl', len(notes), notes, data_source='jsonl_cache',
